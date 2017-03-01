@@ -23,12 +23,20 @@ import static com.google.common.collect.Iterables.filter;
 import static org.apache.jackrabbit.oak.plugins.document.util.Utils.getAllDocuments;
 import static org.apache.jackrabbit.oak.plugins.document.util.Utils.getSelectedDocuments;
 
+import javax.annotation.CheckForNull;
+import javax.annotation.Nullable;
+
+import java.lang.ref.Reference;
+import java.util.Iterator;
 import java.util.Set;
 
+import java.util.concurrent.TimeUnit;
+import org.apache.jackrabbit.oak.commons.IOUtils;
 import org.apache.jackrabbit.oak.plugins.document.NodeDocument.SplitDocType;
 import org.apache.jackrabbit.oak.plugins.document.VersionGarbageCollector.VersionGCStats;
 
 import com.google.common.base.Predicate;
+import org.apache.jackrabbit.oak.plugins.document.util.CloseableIterable;
 
 public class VersionGCSupport {
 
@@ -71,5 +79,40 @@ public class VersionGCSupport {
                         && doc.hasAllRevisionLessThan(oldestRevTimeStamp);
             }
         });
+    }
+
+    /**
+     * Retrieve the time of the oldest document marked as 'deletedOnce'.
+     *
+     * @param precisionMs the exact time may vary by given precision
+     * @return the timestamp of the oldest document marked with 'deletecOnce',
+     *          module given prevision. If no such document exists, returns the
+     *          max time inspected (close to current time).
+     */
+    public long getOldestDeletedOnceTimestamp(long precisionMs) {
+        long ts = 0;
+        long duration = System.currentTimeMillis() / 2;
+        Iterable<NodeDocument> docs;
+
+        while (duration > precisionMs) {
+            docs = getPossiblyDeletedDocs(ts + duration);
+            if (docs.iterator().hasNext()) {
+                // this time interval carries candidates. inspect the lower half.
+                duration /= 2;
+            }
+            else {
+                // nothing found, look newer
+                ts = ts + duration;
+                duration /= 2;
+            }
+            if (docs instanceof CloseableIterable) {
+                IOUtils.closeQuietly((CloseableIterable)docs);
+            }
+        }
+        return ts;
+    }
+
+    public long getDeletedOnceCount() throws UnsupportedOperationException {
+        throw new UnsupportedOperationException("getDeletedOnceCount()");
     }
 }

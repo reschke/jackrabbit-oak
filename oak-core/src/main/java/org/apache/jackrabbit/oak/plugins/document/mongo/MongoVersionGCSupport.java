@@ -19,6 +19,9 @@
 
 package org.apache.jackrabbit.oak.plugins.document.mongo;
 
+import com.mongodb.client.model.DBCollectionCountOptions;
+import com.mongodb.client.model.DBCollectionFindOptions;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 
@@ -93,6 +96,17 @@ public class MongoVersionGCSupport extends VersionGCSupport {
                 return store.convertFromDBObject(NODES, input);
             }
         }), cursor);
+    }
+
+    @Override
+    public long getDeletedOnceCount() {
+        DBObject query = start(NodeDocument.DELETED_ONCE).is(Boolean.TRUE).get();
+        DBCollectionCountOptions options = new DBCollectionCountOptions();
+        options.readPreference(ReadPreference.nearest().secondaryPreferred());
+        if (!disableIndexHint) {
+            options.hint(new BasicDBObject(NodeDocument.DELETED_ONCE, 1));
+        }
+        return getNodeCollection().count(query, options);
     }
 
     @Override
