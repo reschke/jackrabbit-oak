@@ -47,6 +47,7 @@ import org.apache.jackrabbit.oak.commons.sort.StringSort;
 import org.apache.jackrabbit.oak.plugins.document.UpdateOp.Condition;
 import org.apache.jackrabbit.oak.plugins.document.UpdateOp.Key;
 import org.apache.jackrabbit.oak.plugins.document.util.Utils;
+import org.apache.jackrabbit.oak.stats.Clock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -55,6 +56,7 @@ import static com.google.common.base.StandardSystemProperty.LINE_SEPARATOR;
 import static com.google.common.collect.Iterables.all;
 import static com.google.common.collect.Iterators.partition;
 import static com.google.common.util.concurrent.Atomics.newReference;
+import static java.util.Collections.max;
 import static java.util.Collections.singletonMap;
 import static org.apache.jackrabbit.oak.plugins.document.Collection.NODES;
 import static org.apache.jackrabbit.oak.plugins.document.NodeDocument.MODIFIED_IN_SECS;
@@ -75,6 +77,9 @@ public class VersionGarbageCollector {
     private int overflowToDiskThreshold = 100000;
     private long collectLimit = overflowToDiskThreshold;
     private long precisionMs = TimeUnit.MINUTES.toMillis(1);
+    private int maxIterations = 0;
+    private long maxDurationMs = TimeUnit.HOURS.toMillis(0);
+    private long modifyBatchDelayMs = TimeUnit.MILLISECONDS.toMillis(10);
     private final AtomicReference<GCJob> collector = newReference();
 
     private static final Logger log = LoggerFactory.getLogger(VersionGarbageCollector.class);
@@ -96,7 +101,7 @@ public class VersionGarbageCollector {
     private static final String SETTINGS_COLLECTION_OLDEST_TIMESTAMP_PROP = "lastOldestTimeStamp";
 
     /**
-     * Property name to timestamp when last gc run happened
+     * Property name to recommended time interval for next collection run
      */
     private static final String SETTINGS_COLLECTION_REC_INTERVAL_PROP = "recommendedIntervalMs";
 
@@ -109,10 +114,27 @@ public class VersionGarbageCollector {
 
     public VersionGCStats gc(long maxRevisionAge, TimeUnit unit) throws IOException {
         long maxRevisionAgeInMillis = unit.toMillis(maxRevisionAge);
+        long noLongerThan = Revision.getCurrentTimestamp() + maxDurationMs;
         GCJob job = new GCJob(maxRevisionAgeInMillis);
         if (collector.compareAndSet(null, job)) {
+            VersionGCStats stats = new VersionGCStats();
             try {
-                return job.run();
+                long averageDurationMs = 0;
+                while (maxDurationMs <= 0
+                        || (Revision.getCurrentTimestamp() +averageDurationMs) < noLongerThan) {
+                    log.info("start {}. iteration (avg duration {} sec)",
+                            stats.iterationCount, averageDurationMs / 1000.0);
+                    job.run(stats);
+
+                    if (maxIterations > 0 && (stats.iterationCount + 1) >= maxIterations) {
+                        break;
+                    }
+                    if (!stats.nextIteration()) {
+                        break;
+                    }
+                    averageDurationMs = stats.active.elapsed(TimeUnit.MILLISECONDS) / stats.iterationCount;
+                }
+                return stats;
             } finally {
                 collector.set(null);
             }
@@ -128,25 +150,81 @@ public class VersionGarbageCollector {
         }
     }
 
+    /**
+     * Set the limit of number of resource id+_modified strings (not length) held in memory during
+     * a collection run. Any more will be stored and sorted in a temporary file.
+     * @param overflowToDiskThreshold limit after which to use file based storage for candidate ids
+     */
     public void setOverflowToDiskThreshold(int overflowToDiskThreshold) {
         this.overflowToDiskThreshold = overflowToDiskThreshold;
     }
 
+    /**
+     * Sets the absolute limit on number of resource ids collected in one run. This does not count
+     * nodes which can be deleted immediately. When this limit is exceeded, the run either fails or
+     * is attempted with different parameters, depending on other settings. Note that if the inspected
+     * time interval is equal or less than {@link #precisionMs}, the collection limit will be ignored.
+     *
+     * @param limit the absolute limit of resources collected in one run
+     */
     public void setCollectLimit(long limit) {
         this.collectLimit = limit;
     }
 
-    public void setPrecisionMs(long ms) { this.precisionMs = ms; }
+    /**
+     * Set the minimum duration that is used for time based searches. This should at minimum be the
+     * precision available on modification dates of documents, but can be set larger to avoid querying
+     * the database too often. Note however that {@link #collectLimit} will not take effect for runs
+     * that query equal or shorter than precision duration.
+     *
+     * @param unit time unit used for duration
+     * @param t    the number of units in the duration
+     */
+    public void setPrecisionMs(TimeUnit unit, long t) { this.precisionMs = unit.toMillis(t); }
+
+    /**
+     * Set the maximum duration in elapsed time that the garbage collection shall take. Setting this
+     * to 0 means that there is no limit imposed. A positive duration will impose a soft limit, e.g.
+     * the collection might take longer, but no next iteration will be attempted afterwards. See
+     * {@link #setMaxIterations(int)} on how to control the behaviour.
+     *
+     * @param unit time unit used for duration
+     * @param t    the number of units in the duration
+     */
+    public void setMaxDuration(TimeUnit unit, long t) { this.maxDurationMs = unit.toMillis(t); }
+
+    /**
+     * Set the maxiumum number of iterations that shall be attempted in a single run. A value
+     * of 0 means that there is no limit. Since the garbage collector uses iterations to find
+     * suitable time intervals and set sizes for cleanups, limiting the iterations is only
+     * recommended for setups where the collector is called often.
+     *
+     * @param max the maximum number of iterations allowed
+     */
+    public void setMaxIterations(int max) { this.maxIterations = max; }
+
+    /**
+     * Set a sleep interval between batched database modifications. This rate limits the writes
+     * to the database by a garbage collector. 0, e.g. no delay, is the default. This is recommended
+     * when garbage collection is done during a maintenance time when other system load is low.
+     *
+     * @param unit the unit used for the duration
+     * @param t    the number of unit in the duration
+     */
+    public void setModifyBatchDelayMs(TimeUnit unit, long t) { this.modifyBatchDelayMs = unit.toMillis(t); }
 
     public static class VersionGCStats {
         boolean ignoredGCDueToCheckPoint;
         boolean canceled;
         boolean limitExceeded;
+        boolean needRepeat;
+        int iterationCount;
         int deletedDocGCCount;
         int deletedLeafDocGCCount;
         int splitDocGCCount;
         int intermediateSplitDocGCCount;
         int updateResurrectedGCCount;
+        final Stopwatch active = Stopwatch.createUnstarted();
         final Stopwatch collectDeletedDocs = Stopwatch.createUnstarted();
         final Stopwatch checkDeletedDocs = Stopwatch.createUnstarted();
         final Stopwatch deleteDeletedDocs = Stopwatch.createUnstarted();
@@ -163,12 +241,26 @@ public class VersionGarbageCollector {
                     ", updateResurrectedGCCount=" + updateResurrectedGCCount +
                     ", splitDocGCCount=" + splitDocGCCount +
                     ", intermediateSplitDocGCCount=" + intermediateSplitDocGCCount +
+                    ", iterationCount=" + iterationCount +
+                    ", timeActive=" + active +
                     ", timeToCollectDeletedDocs=" + collectDeletedDocs +
                     ", timeToCheckDeletedDocs=" + checkDeletedDocs +
                     ", timeToSortDocIds=" + sortDocIds +
                     ", timeTakenToDeleteDeletedDocs=" + deleteDeletedDocs +
                     ", timeTakenToCollectAndDeleteSplitDocs=" + collectAndDeleteSplitDocs +
                     '}';
+        }
+
+        boolean nextIteration() {
+            if (!needRepeat) {
+                return false;
+            }
+            ++iterationCount;
+            ignoredGCDueToCheckPoint = false;
+            canceled = false;
+            limitExceeded = false;
+            needRepeat = false;
+            return true;
         }
     }
 
@@ -195,8 +287,8 @@ public class VersionGarbageCollector {
         private final Map<GCPhase, Stopwatch> watches = Maps.newHashMap();
         private final AtomicBoolean canceled;
 
-        GCPhases(AtomicBoolean canceled) {
-            this.stats = new VersionGCStats();
+        GCPhases(AtomicBoolean canceled, VersionGCStats stats) {
+            this.stats = stats;
             this.elapsed = Stopwatch.createStarted();
             this.watches.put(GCPhase.NONE, Stopwatch.createStarted());
             this.watches.put(GCPhase.COLLECTING, stats.collectDeletedDocs);
@@ -272,8 +364,8 @@ public class VersionGarbageCollector {
             this.maxRevisionAgeMillis = maxRevisionAgeMillis;
         }
 
-        VersionGCStats run() throws IOException {
-            return gc(maxRevisionAgeMillis);
+        VersionGCStats run(VersionGCStats stats) throws IOException {
+            return gc(stats, maxRevisionAgeMillis);
         }
 
         void cancel() {
@@ -281,11 +373,10 @@ public class VersionGarbageCollector {
             cancel.set(true);
         }
 
-        private VersionGCStats gc(long maxRevisionAgeInMillis) throws IOException {
+        private VersionGCStats gc(VersionGCStats stats, long maxRevisionAgeInMillis) throws IOException {
+            stats.active.start();
             Recommendations rec = new Recommendations(maxRevisionAgeInMillis, precisionMs, collectLimit);
-            GCPhases phases = new GCPhases(cancel);
-            VersionGCStats stats = phases.stats;
-
+            GCPhases phases = new GCPhases(cancel, stats);
             try {
                 if (rec.ignoreDueToCheckPoint) {
                     phases.stats.ignoredGCDueToCheckPoint = true;
@@ -297,7 +388,6 @@ public class VersionGarbageCollector {
                 }
             } catch (LimitExceededException ex) {
                 stats.limitExceeded = true;
-                cancel.set(true);
             } finally {
                 phases.close();
                 stats.canceled = cancel.get();
@@ -305,6 +395,7 @@ public class VersionGarbageCollector {
 
             rec.evaluate(stats);
             log.info("Revision garbage collection finished in {}. {}", phases.elapsed, stats);
+            stats.active.stop();
             return stats;
         }
 
@@ -489,12 +580,14 @@ public class VersionGarbageCollector {
             leafDocIdsToDelete.clear();
             stats.deletedLeafDocGCCount += removeCount;
             stats.deletedDocGCCount += removeCount;
+            delayOnModifications();
         }
 
         void updateResurrectedDocuments(VersionGCStats stats) throws IOException {
             int updateCount = resetDeletedOnce(resurrectedIds);
             resurrectedIds.clear();
             stats.updateResurrectedGCCount += updateCount;
+            delayOnModifications();
         }
 
         public void close() {
@@ -511,6 +604,17 @@ public class VersionGarbageCollector {
         }
 
         //------------------------------< internal >----------------------------
+
+        private void delayOnModifications() {
+            if (modifyBatchDelayMs > 0 && !cancel.get()) {
+                try {
+                    Thread.sleep(modifyBatchDelayMs);
+                }
+                catch (InterruptedException ex) {
+                    /* ignore */
+                }
+            }
+        }
 
         private Iterator<String> previousDocIdsFor(NodeDocument doc) {
             Map<Revision, Range> prevRanges = doc.getPreviousRanges(true);
@@ -649,6 +753,7 @@ public class VersionGarbageCollector {
                     String msg = String.format("Deleted %d (%1.2f%%) documents so far", deletedCount, progress);
                     log.info(msg);
                 }
+                delayOnModifications();
             }
             return deletedCount;
         }
@@ -763,6 +868,7 @@ public class VersionGarbageCollector {
         private final long suggestedIntervalMs;
         private final long preferredLimit;
         private long revisionsOldest;
+        private boolean coversUntilNow;
 
         /**
          * Gives a recommendation about parameters for the next revision garbage collection run.
@@ -786,11 +892,12 @@ public class VersionGarbageCollector {
          * @param collectLimit the desired maximum amount of documents to be collected
          */
         Recommendations(long maxRevisionAgeMs, long precisionMs, long collectLimit) {
+            long revisionsOlderThan = nodeStore.getClock().getTime() - maxRevisionAgeMs;
             boolean ignoreDueToCheckPoint = false;
-            this.preferredLimit = Math.min(collectLimit, COLLECT_MAX_SOFT);
 
             this.precisionMs = precisionMs;
-            long revisionsOlderThan = nodeStore.getClock().getTime() - maxRevisionAgeMs;
+            preferredLimit = Math.min(collectLimit, COLLECT_MAX_SOFT);
+            coversUntilNow = true;
             log.info("Starting revision garbage collection. Looking at revisions older than [{}]",
                     Utils.timestampToString(revisionsOlderThan));
 
@@ -826,6 +933,7 @@ public class VersionGarbageCollector {
                 suggestedIntervalMs = Math.max(suggestedIntervalMs, precisionMs);
                 if (revisionsOlderThan > revisionsOldest + suggestedIntervalMs) {
                     revisionsOlderThan = revisionsOldest + suggestedIntervalMs;
+                    coversUntilNow = false;
                     log.debug("previous runs recommend a {} sec duration, lowering older to [{}]",
                             TimeUnit.MILLISECONDS.toSeconds(suggestedIntervalMs),
                             Utils.timestampToString(revisionsOlderThan));
@@ -843,6 +951,7 @@ public class VersionGarbageCollector {
                     ignoreDueToCheckPoint = true;
                 }
                 revisionsOlderThan = checkpoint.getTimestamp() - precisionMs;
+                coversUntilNow = false;
             }
 
             if (revisionsOlderThan - revisionsOldest <= precisionMs) {
@@ -859,10 +968,21 @@ public class VersionGarbageCollector {
 
         /**
          * Evaluate the results of the last run. Update recommendations for future runs.
+         * Will set {@link VersionGCStats#needRepeat} if collection needs to run another
+         * iteration for collecting documents up to "now".
+         *
          * @param stats the statistics from the last run
          */
         public void evaluate(VersionGCStats stats) {
-            if (!stats.canceled) {
+            if (stats.limitExceeded) {
+                // if the limit was exceeded, slash the recommended interval in half.
+                long nextDuration = Math.max(precisionMs, (revisionsOlderThan - revisionsOldest) / 2);
+                log.info("Limit {} documents exceeded, reducing next collection interval to {} seconds",
+                        this.preferredLimit, TimeUnit.MILLISECONDS.toSeconds(nextDuration));
+                setLongSetting(SETTINGS_COLLECTION_REC_INTERVAL_PROP, nextDuration);
+                stats.needRepeat = true;
+            }
+            else if (!stats.canceled && !stats.ignoredGCDueToCheckPoint) {
                 // success, we would not expect to encounter revisions older than this in the future
                 setLongSetting(SETTINGS_COLLECTION_OLDEST_TIMESTAMP_PROP, revisionsOlderThan);
 
@@ -878,12 +998,7 @@ public class VersionGarbageCollector {
                         setLongSetting(SETTINGS_COLLECTION_REC_INTERVAL_PROP, nextDuration);
                     }
                 }
-            } else if (stats.limitExceeded) {
-                // if the limit was exceeded, slash the recommended interval in half.
-                long nextDuration = Math.max(precisionMs, (revisionsOlderThan - revisionsOldest) / 2);
-                log.info("Limit {} documents exceeded, reducing next collection interval to {} seconds",
-                        this.preferredLimit, TimeUnit.MILLISECONDS.toSeconds(nextDuration));
-                setLongSetting(SETTINGS_COLLECTION_REC_INTERVAL_PROP, nextDuration);
+                stats.needRepeat = !coversUntilNow;
             }
         }
 

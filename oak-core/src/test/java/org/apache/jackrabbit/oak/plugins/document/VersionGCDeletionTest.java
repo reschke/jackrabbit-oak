@@ -440,14 +440,13 @@ public class VersionGCDeletionTest {
 
         // The first attempt will hit the collection limit and fail.
         // However repeated attempts will finally succeed and cleanup everything
+        gc.setMaxIterations(1);
         VersionGCStats stats = gc.gc(maxAge * 2, HOURS);
         assertEquals(stats.limitExceeded, true);
-        while (true) {
-            stats = gc.gc(maxAge * 2, HOURS);
-            if (stats.deletedLeafDocGCCount > 0) {
-                break;
-            }
-        }
+
+        gc.setMaxIterations(0);
+        gc.setMaxDuration(TimeUnit.MINUTES, 5);
+        stats = gc.gc(maxAge * 2, HOURS);
         assertEquals(stats.canceled, false);
         assertEquals(noOfDocsToDelete * 2 + 1, stats.deletedDocGCCount);
         assertEquals(noOfDocsToDelete, stats.deletedLeafDocGCCount);
@@ -499,6 +498,7 @@ public class VersionGCDeletionTest {
 
         VersionGarbageCollector gc = store.getVersionGarbageCollector();
         gc.setCollectLimit(101);
+        gc.setMaxIterations(1);
 
         // The first attempt will hit the collection limit and fail.
         // However repeated attempts will finally succeed and cleanup a chunk of docs
@@ -521,6 +521,58 @@ public class VersionGCDeletionTest {
             assertNull(ts.find(Collection.NODES, "2:/a" + i + "/b" + i));
             assertNull(ts.find(Collection.NODES, "1:/a" + i));
         }
+    }
+
+    @Test
+    public void deleteChunksInIterations() throws Exception{
+        int noOfDocsInChunk = 100;
+        int noOfChunks = 10;
+        DocumentStore ts = new MemoryDocumentStore();
+        store = new DocumentMK.Builder()
+                .clock(clock)
+                .setDocumentStore(new MemoryDocumentStore())
+                .setAsyncDelay(0)
+                .getNodeStore();
+        Revision.setClock(clock);
+
+        //Baseline the clock
+        clock.waitUntil(Revision.getCurrentTimestamp());
+
+        for (int i = 0; i < noOfChunks; ++i) {
+            NodeBuilder b1 = store.getRoot().builder();
+            NodeBuilder xb = b1.child("x"+i);
+            for (int j = 0; j < noOfDocsInChunk; ++j){
+                xb.child("a"+j).child("b"+j);
+            }
+            store.merge(b1, EmptyHook.INSTANCE, CommitInfo.EMPTY);
+            clock.waitUntil(Revision.getCurrentTimestamp()  + HOURS.toMillis(1));
+        }
+
+        long maxAge = 2; //hours
+        long delta = TimeUnit.MINUTES.toMillis(10);
+
+        for (int i = 0; i < noOfChunks; ++i) {
+            NodeBuilder b2 = store.getRoot().builder();
+            b2.child("x"+i).remove();
+            merge(store, b2);
+            clock.waitUntil(clock.getTime()  + HOURS.toMillis(1));
+        }
+
+        clock.waitUntil(Revision.getCurrentTimestamp()  + HOURS.toMillis(maxAge));
+        store.runBackgroundOperations();
+
+        VersionGarbageCollector gc = store.getVersionGarbageCollector();
+        // limit chunk size and allow unlimited iterations
+        gc.setCollectLimit(101);
+        gc.setMaxIterations(0);
+        VersionGCStats stats = gc.gc(maxAge, HOURS);
+
+        // All should be cleaned up now in > nOfChunks iterations
+        assertEquals(stats.limitExceeded, false);
+        assertEquals(stats.canceled, false);
+        assertEquals((noOfDocsInChunk * 2 + 1) * noOfChunks, stats.deletedDocGCCount);
+        assertEquals(noOfDocsInChunk * noOfChunks, stats.deletedLeafDocGCCount);
+        assertTrue(stats.iterationCount > noOfChunks);
     }
 
     private void merge(DocumentNodeStore store, NodeBuilder builder)
