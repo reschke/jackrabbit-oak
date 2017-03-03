@@ -45,6 +45,8 @@ import java.util.UUID;
 import javax.annotation.CheckForNull;
 import javax.annotation.Nonnull;
 
+import com.google.common.base.Charsets;
+import com.google.common.collect.AbstractIterator;
 import org.apache.commons.io.HexDump;
 import org.apache.commons.io.output.ByteArrayOutputStream;
 import org.apache.jackrabbit.oak.api.PropertyState;
@@ -52,9 +54,6 @@ import org.apache.jackrabbit.oak.api.Type;
 import org.apache.jackrabbit.oak.commons.StringUtils;
 import org.apache.jackrabbit.oak.plugins.memory.PropertyStates;
 import org.apache.jackrabbit.oak.segment.RecordNumbers.Entry;
-
-import com.google.common.base.Charsets;
-import com.google.common.collect.AbstractIterator;
 
 /**
  * A list of records.
@@ -140,9 +139,6 @@ public class Segment {
     public static final int RECORD_NUMBER_COUNT_OFFSET = 18;
 
     @Nonnull
-    private final SegmentStore store;
-
-    @Nonnull
     private final SegmentReader reader;
 
     @Nonnull
@@ -179,11 +175,10 @@ public class Segment {
         return (address + boundary - 1) & ~(boundary - 1);
     }
 
-    public Segment(@Nonnull SegmentStore store,
+    public Segment(@Nonnull SegmentIdProvider idProvider,
                    @Nonnull SegmentReader reader,
                    @Nonnull final SegmentId id,
                    @Nonnull final ByteBuffer data) {
-        this.store = checkNotNull(store);
         this.reader = checkNotNull(reader);
         this.id = checkNotNull(id);
         this.data = checkNotNull(data);
@@ -202,7 +197,7 @@ public class Segment {
             });
             this.version = SegmentVersion.fromByte(segmentVersion);
             this.recordNumbers = readRecordNumberOffsets();
-            this.segmentReferences = readReferencedSegments();
+            this.segmentReferences = readReferencedSegments(idProvider);
         } else {
             this.version = LATEST_VERSION;
             this.recordNumbers = new IdentityRecordNumbers();
@@ -253,7 +248,8 @@ public class Segment {
         return new ImmutableRecordNumbers(offsets, types);
     }
 
-    private SegmentReferences readReferencedSegments() {
+    private SegmentReferences readReferencedSegments(
+            final SegmentIdProvider idProvider) {
         checkState(getReferencedSegmentIdCount() + 1 < 0xffff,
                 "Segment cannot have more than 0xffff references");
 
@@ -272,7 +268,7 @@ public class Segment {
                             int position = refOffset + (reference - 1) * SEGMENT_REFERENCE_SIZE;
                             long msb = data.getLong(position);
                             long lsb = data.getLong(position + 8);
-                            id = store.newSegmentId(msb, lsb);
+                            id = idProvider.newSegmentId(msb, lsb);
                             refIds[reference - 1] = id;
                         }
                     }
@@ -280,6 +276,7 @@ public class Segment {
                 return id;
             }
 
+            @Nonnull
             @Override
             public Iterator<SegmentId> iterator() {
                 return new AbstractIterator<SegmentId>() {
@@ -297,16 +294,15 @@ public class Segment {
         };
     }
 
-    Segment(@Nonnull SegmentStore store,
+    Segment(@Nonnull SegmentId id,
             @Nonnull SegmentReader reader,
             @Nonnull byte[] buffer,
             @Nonnull RecordNumbers recordNumbers,
             @Nonnull SegmentReferences segmentReferences,
             @Nonnull String info
     ) {
-        this.store = checkNotNull(store);
+        this.id = checkNotNull(id);
         this.reader = checkNotNull(reader);
-        this.id = store.newDataSegmentId();
         this.info = checkNotNull(info);
         this.data = ByteBuffer.wrap(checkNotNull(buffer));
         this.version = SegmentVersion.fromByte(buffer[3]);
@@ -466,6 +462,7 @@ public class Segment {
         d.get(buffer, offset, length);
     }
 
+    @Nonnull
     RecordId readRecordId(int recordNumber, int rawOffset, int recordIdOffset) {
         return internalReadRecordId(pos(recordNumber, rawOffset, recordIdOffset, RECORD_ID_BYTES));
     }
@@ -478,6 +475,7 @@ public class Segment {
         return readRecordId(recordNumber, 0, 0);
     }
 
+    @Nonnull
     private RecordId internalReadRecordId(int pos) {
         SegmentId segmentId = dereferenceSegmentId(asUnsigned(data.getShort(pos)));
         return new RecordId(segmentId, data.getInt(pos + 2));
@@ -487,6 +485,7 @@ public class Segment {
         return value & 0xffff;
     }
 
+    @Nonnull
     private SegmentId dereferenceSegmentId(int reference) {
         if (reference == 0) {
             return id;

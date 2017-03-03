@@ -96,7 +96,7 @@ public class ReadOnlyFileStore extends AbstractFileStore {
 
     ReadOnlyFileStore bind(@Nonnull ReadOnlyRevisions revisions) throws IOException {
         this.revisions = revisions;
-        this.revisions.bind(this);
+        this.revisions.bind(this, tracker);
         currentHead = revisions.getHead();
         return this;
     }
@@ -107,7 +107,7 @@ public class ReadOnlyFileStore extends AbstractFileStore {
      * @param revision
      */
     public void setRevision(String revision) {
-        RecordId newHead = RecordId.fromString(this, revision);
+        RecordId newHead = RecordId.fromString(tracker, revision);
         if (revisions.setHead(currentHead, newHead)) {
             currentHead = newHead;
         }
@@ -173,7 +173,7 @@ public class ReadOnlyFileStore extends AbstractFileStore {
                     if (buffer == null) {
                         throw new SegmentNotFoundException(id);
                     }
-                    return new Segment(ReadOnlyFileStore.this, segmentReader, id, buffer);
+                    return new Segment(tracker, segmentReader, id, buffer);
                 }
             });
         } catch (ExecutionException e) {
@@ -233,7 +233,7 @@ public class ReadOnlyFileStore extends AbstractFileStore {
             for (UUID uuid : reader.getUUIDs()) {
                 long msb = uuid.getMostSignificantBits();
                 long lsb = uuid.getLeastSignificantBits();
-                ids.add(newSegmentId(msb, lsb));
+                ids.add(tracker.newSegmentId(msb, lsb));
             }
         }
         return ids;
@@ -242,5 +242,9 @@ public class ReadOnlyFileStore extends AbstractFileStore {
     @Override
     public ReadOnlyRevisions getRevisions() {
         return revisions;
+    }
+
+    public Set<SegmentId> getReferencedSegmentIds() {
+        return tracker.getReferencedSegmentIds();
     }
 }

@@ -44,6 +44,7 @@ import org.apache.jackrabbit.oak.segment.SegmentBlob;
 import org.apache.jackrabbit.oak.segment.SegmentCache;
 import org.apache.jackrabbit.oak.segment.SegmentId;
 import org.apache.jackrabbit.oak.segment.SegmentIdFactory;
+import org.apache.jackrabbit.oak.segment.SegmentIdProvider;
 import org.apache.jackrabbit.oak.segment.SegmentNodeState;
 import org.apache.jackrabbit.oak.segment.SegmentReader;
 import org.apache.jackrabbit.oak.segment.SegmentStore;
@@ -104,22 +105,16 @@ public abstract class AbstractFileStore implements SegmentStore, Closeable {
 
     };
 
-    @Nonnull
-    private final SegmentIdFactory segmentIdFactory = new SegmentIdFactory() {
-
-        @Override
-        @Nonnull
-        public SegmentId newSegmentId(long msb, long lsb) {
-            return new SegmentId(AbstractFileStore.this, msb, lsb);
-        }
-
-    };
-
     protected final IOMonitor ioMonitor;
 
     AbstractFileStore(final FileStoreBuilder builder) {
         this.directory = builder.getDirectory();
-        this.tracker = new SegmentTracker();
+        this.tracker = new SegmentTracker(new SegmentIdFactory() {
+            @Override @Nonnull
+            public SegmentId newSegmentId(long msb, long lsb) {
+                return new SegmentId(AbstractFileStore.this, msb, lsb);
+            }
+        });
         this.blobStore = builder.getBlobStore();
         this.segmentCache = new SegmentCache(builder.getSegmentCacheSize());
         this.segmentReader = new CachingSegmentReader(new Supplier<SegmentWriter>() {
@@ -217,16 +212,16 @@ public abstract class AbstractFileStore implements SegmentStore, Closeable {
     }
 
     @Nonnull
-    public SegmentTracker getTracker() {
-        return tracker;
-    }
-
-    @Nonnull
     public abstract SegmentWriter getWriter();
 
     @Nonnull
     public SegmentReader getReader() {
         return segmentReader;
+    }
+
+    @Nonnull
+    public SegmentIdProvider getSegmentIdProvider() {
+        return tracker;
     }
 
     /**
@@ -247,24 +242,6 @@ public abstract class AbstractFileStore implements SegmentStore, Closeable {
         return segmentReader.readHeadState(getRevisions());
     }
 
-    @Override
-    @Nonnull
-    public SegmentId newSegmentId(long msb, long lsb) {
-        return tracker.newSegmentId(msb, lsb, segmentIdFactory);
-    }
-
-    @Override
-    @Nonnull
-    public SegmentId newBulkSegmentId() {
-        return tracker.newBulkSegmentId(segmentIdFactory);
-    }
-
-    @Override
-    @Nonnull
-    public SegmentId newDataSegmentId() {
-        return tracker.newDataSegmentId(segmentIdFactory);
-    }
-
     /**
      * @return  the external BlobStore (if configured) with this store, {@code null} otherwise.
      */
@@ -280,7 +257,7 @@ public abstract class AbstractFileStore implements SegmentStore, Closeable {
         int generation = Segment.getGcGeneration(buffer, id);
         w.writeEntry(msb, lsb, data, 0, data.length, generation);
         if (SegmentId.isDataSegmentId(lsb)) {
-            Segment segment = new Segment(this, segmentReader, newSegmentId(msb, lsb), buffer);
+            Segment segment = new Segment(tracker, segmentReader, tracker.newSegmentId(msb, lsb), buffer);
             populateTarGraph(segment, w);
             populateTarBinaryReferences(segment, w);
         }

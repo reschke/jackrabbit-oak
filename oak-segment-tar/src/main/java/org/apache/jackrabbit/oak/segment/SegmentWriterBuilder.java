@@ -146,6 +146,7 @@ public final class SegmentWriterBuilder {
         return new SegmentWriter(
                 checkNotNull(store),
                 store.getReader(),
+                store.getSegmentIdProvider(),
                 store.getBlobStore(),
                 cacheManager,
                 createWriter(store, pooled)
@@ -162,6 +163,7 @@ public final class SegmentWriterBuilder {
         return new SegmentWriter(
                 checkNotNull(store),
                 store.getReader(),
+                store.getSegmentIdProvider(),
                 store.getBlobStore(),
                 cacheManager,
                 new WriteOperationHandler() {
@@ -172,7 +174,7 @@ public final class SegmentWriterBuilder {
                     }
 
                     @Override
-                    public void flush() {
+                    public void flush(@Nonnull SegmentStore store) {
                         throw new UnsupportedOperationException("Cannot write to read-only store");
                     }
                 });
@@ -186,6 +188,7 @@ public final class SegmentWriterBuilder {
         return new SegmentWriter(
                 checkNotNull(store),
                 store.getReader(),
+                store.getSegmentIdProvider(),
                 store.getBlobStore(),
                 cacheManager,
                 createWriter(store, pooled)
@@ -196,16 +199,14 @@ public final class SegmentWriterBuilder {
     private WriteOperationHandler createWriter(@Nonnull FileStore store, boolean pooled) {
         if (pooled) {
             return new SegmentBufferWriterPool(
-                    store,
-                    store.getTracker(),
+                    store.getSegmentIdProvider(),
                     store.getReader(),
                     name,
                     generation
             );
         } else {
             return new SegmentBufferWriter(
-                    store,
-                    store.getTracker().getSegmentCounter(),
+                    store.getSegmentIdProvider(),
                     store.getReader(),
                     name,
                     generation.get()
@@ -217,16 +218,14 @@ public final class SegmentWriterBuilder {
     private WriteOperationHandler createWriter(@Nonnull MemoryStore store, boolean pooled) {
         if (pooled) {
             return new SegmentBufferWriterPool(
-                    store,
-                    store.getTracker(),
+                    store.getSegmentIdProvider(),
                     store.getReader(),
                     name,
                     generation
             );
         } else {
             return new SegmentBufferWriter(
-                    store,
-                    store.getTracker().getSegmentCounter(),
+                    store.getSegmentIdProvider(),
                     store.getReader(),
                     name,
                     generation.get()

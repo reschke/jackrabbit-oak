@@ -22,6 +22,7 @@ import static org.apache.jackrabbit.oak.segment.SegmentWriterBuilder.segmentWrit
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.Set;
 import java.util.concurrent.ConcurrentMap;
 
 import javax.annotation.CheckForNull;
@@ -34,6 +35,7 @@ import org.apache.jackrabbit.oak.segment.Revisions;
 import org.apache.jackrabbit.oak.segment.Segment;
 import org.apache.jackrabbit.oak.segment.SegmentId;
 import org.apache.jackrabbit.oak.segment.SegmentIdFactory;
+import org.apache.jackrabbit.oak.segment.SegmentIdProvider;
 import org.apache.jackrabbit.oak.segment.SegmentNotFoundException;
 import org.apache.jackrabbit.oak.segment.SegmentReader;
 import org.apache.jackrabbit.oak.segment.SegmentStore;
@@ -47,7 +49,7 @@ import org.apache.jackrabbit.oak.spi.blob.BlobStore;
 public class MemoryStore implements SegmentStore {
 
     @Nonnull
-    private final SegmentTracker tracker = new SegmentTracker();
+    private final SegmentTracker tracker;
 
     @Nonnull
     private final MemoryStoreRevisions revisions;
@@ -58,20 +60,16 @@ public class MemoryStore implements SegmentStore {
     @Nonnull
     private final SegmentWriter segmentWriter;
 
-    private final SegmentIdFactory segmentIdFactory = new SegmentIdFactory() {
-
-        @Override
-        @Nonnull
-        public SegmentId newSegmentId(long msb, long lsb) {
-            return new SegmentId(MemoryStore.this, msb, lsb);
-        }
-
-    };
-
     private final ConcurrentMap<SegmentId, Segment> segments =
             Maps.newConcurrentMap();
 
     public MemoryStore() throws IOException {
+        this.tracker = new SegmentTracker(new SegmentIdFactory() {
+            @Override @Nonnull
+            public SegmentId newSegmentId(long msb, long lsb) {
+                return new SegmentId(MemoryStore.this, msb, lsb);
+            }
+        });
         this.revisions = new MemoryStoreRevisions();
         Supplier<SegmentWriter> getWriter = new Supplier<SegmentWriter>() {
             @Override
@@ -86,11 +84,6 @@ public class MemoryStore implements SegmentStore {
     }
 
     @Nonnull
-    public SegmentTracker getTracker() {
-        return tracker;
-    }
-
-    @Nonnull
     public SegmentWriter getWriter() {
         return segmentWriter;
     }
@@ -98,6 +91,11 @@ public class MemoryStore implements SegmentStore {
     @Nonnull
     public SegmentReader getReader() {
         return segmentReader;
+    }
+
+    @Nonnull
+    public SegmentIdProvider getSegmentIdProvider() {
+        return tracker;
     }
 
     @Nonnull
@@ -120,30 +118,12 @@ public class MemoryStore implements SegmentStore {
     }
 
     @Override
-    @Nonnull
-    public SegmentId newSegmentId(long msb, long lsb) {
-        return tracker.newSegmentId(msb, lsb, segmentIdFactory);
-    }
-
-    @Override
-    @Nonnull
-    public SegmentId newBulkSegmentId() {
-        return tracker.newBulkSegmentId(segmentIdFactory);
-    }
-
-    @Override
-    @Nonnull
-    public SegmentId newDataSegmentId() {
-        return tracker.newDataSegmentId(segmentIdFactory);
-    }
-
-    @Override
     public void writeSegment(
             SegmentId id, byte[] data, int offset, int length) throws IOException {
         ByteBuffer buffer = ByteBuffer.allocate(length);
         buffer.put(data, offset, length);
         buffer.rewind();
-        Segment segment = new Segment(this, segmentReader, id, buffer);
+        Segment segment = new Segment(tracker, segmentReader, id, buffer);
         if (segments.putIfAbsent(id, segment) != null) {
             throw new IOException("Segment override: " + id);
         }
@@ -162,4 +142,7 @@ public class MemoryStore implements SegmentStore {
         segments.keySet().retainAll(tracker.getReferencedSegmentIds());
     }
 
+    public Set<SegmentId> getReferencedSegmentIds() {
+        return tracker.getReferencedSegmentIds();
+    }
 }

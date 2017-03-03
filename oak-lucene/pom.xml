@@ -126,7 +126,7 @@
             <Embed-Dependency>
                 lucene-*;inline=true,
               <!-- TODO FIXME OAK-3598 -->
-              oak-core;inline="org/apache/jackrabbit/oak/cache/CacheStats*"
+              oak-core;inline="org/apache/jackrabbit/oak/cache/AbstractCacheStats.class|org/apache/jackrabbit/oak/cache/CacheStats.class"
               <!-- TODO FIXME OAK-3598 -->
             </Embed-Dependency>
           </instructions>
@@ -268,12 +268,6 @@
       <artifactId>oak-core</artifactId>
       <version>${project.version}</version>
       <classifier>tests</classifier>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.jackrabbit</groupId>
-      <artifactId>oak-segment</artifactId>
-      <version>${project.version}</version>
       <scope>test</scope>
     </dependency>
     <dependency>
