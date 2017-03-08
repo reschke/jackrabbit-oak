@@ -26,8 +26,11 @@ import static org.apache.jackrabbit.oak.plugins.document.util.Utils.getSelectedD
 import javax.annotation.CheckForNull;
 import javax.annotation.Nullable;
 
+import java.io.Closeable;
 import java.lang.ref.Reference;
+import java.util.Calendar;
 import java.util.Iterator;
+import java.util.Locale;
 import java.util.Set;
 
 import java.util.concurrent.TimeUnit;
@@ -37,8 +40,14 @@ import org.apache.jackrabbit.oak.plugins.document.VersionGarbageCollector.Versio
 
 import com.google.common.base.Predicate;
 import org.apache.jackrabbit.oak.plugins.document.util.CloseableIterable;
+import org.apache.jackrabbit.oak.plugins.document.util.Utils;
+import org.apache.jackrabbit.oak.stats.Clock;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class VersionGCSupport {
+
+    private static final Logger Log = LoggerFactory.getLogger(VersionGCSupport.class);
 
     private final DocumentStore store;
 
@@ -89,26 +98,30 @@ public class VersionGCSupport {
      *          module given prevision. If no such document exists, returns the
      *          max time inspected (close to current time).
      */
-    public long getOldestDeletedOnceTimestamp(long precisionMs) {
+    public long getOldestDeletedOnceTimestamp(Clock clock, long precisionMs) {
         long ts = 0;
-        long duration = System.currentTimeMillis() / 2;
+        long now = clock.getTime();
+        long duration =  (now - ts) / 2;
         Iterable<NodeDocument> docs;
 
         while (duration > precisionMs) {
+            // check for delete candidates in [ ts, ts + duration]
+            Log.debug("find oldest _deletedOnce, check < {}", Utils.timestampToString(ts + duration));
             docs = getPossiblyDeletedDocs(ts + duration);
             if (docs.iterator().hasNext()) {
-                // this time interval carries candidates. inspect the lower half.
+                // look if there are still nodes to be found in the lower half
                 duration /= 2;
             }
             else {
-                // nothing found, look newer
+                // so, there are no delete candidates older than "ts + duration"
                 ts = ts + duration;
                 duration /= 2;
             }
-            if (docs instanceof CloseableIterable) {
-                IOUtils.closeQuietly((CloseableIterable)docs);
+            if (docs instanceof Closeable) {
+                IOUtils.closeQuietly((Closeable)docs);
             }
         }
+        Log.debug("find oldest _deletedOnce to be {}", Utils.timestampToString(ts));
         return ts;
     }
 

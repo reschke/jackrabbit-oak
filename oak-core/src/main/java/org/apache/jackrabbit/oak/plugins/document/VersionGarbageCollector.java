@@ -21,6 +21,7 @@ package org.apache.jackrabbit.oak.plugins.document;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.Iterator;
 import java.util.List;
@@ -47,7 +48,6 @@ import org.apache.jackrabbit.oak.commons.sort.StringSort;
 import org.apache.jackrabbit.oak.plugins.document.UpdateOp.Condition;
 import org.apache.jackrabbit.oak.plugins.document.UpdateOp.Key;
 import org.apache.jackrabbit.oak.plugins.document.util.Utils;
-import org.apache.jackrabbit.oak.stats.Clock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -56,9 +56,9 @@ import static com.google.common.base.StandardSystemProperty.LINE_SEPARATOR;
 import static com.google.common.collect.Iterables.all;
 import static com.google.common.collect.Iterators.partition;
 import static com.google.common.util.concurrent.Atomics.newReference;
-import static java.util.Collections.max;
 import static java.util.Collections.singletonMap;
 import static org.apache.jackrabbit.oak.plugins.document.Collection.NODES;
+import static org.apache.jackrabbit.oak.plugins.document.Collection.SETTINGS;
 import static org.apache.jackrabbit.oak.plugins.document.NodeDocument.MODIFIED_IN_SECS;
 import static org.apache.jackrabbit.oak.plugins.document.NodeDocument.SplitDocType.COMMIT_ROOT_ONLY;
 import static org.apache.jackrabbit.oak.plugins.document.NodeDocument.SplitDocType.DEFAULT_LEAF;
@@ -70,7 +70,6 @@ public class VersionGarbageCollector {
     private static final int UPDATE_BATCH_SIZE = 450;
     private static final int PROGRESS_BATCH_SIZE = 10000;
     private static final Key KEY_MODIFIED = new Key(MODIFIED_IN_SECS, null);
-    private static final int COLLECT_MAX_SOFT = 50000;
     private final DocumentNodeStore nodeStore;
     private final DocumentStore ds;
     private final VersionGCSupport versionStore;
@@ -114,14 +113,14 @@ public class VersionGarbageCollector {
 
     public VersionGCStats gc(long maxRevisionAge, TimeUnit unit) throws IOException {
         long maxRevisionAgeInMillis = unit.toMillis(maxRevisionAge);
-        long noLongerThan = Revision.getCurrentTimestamp() + maxDurationMs;
+        long noLongerThan = nodeStore.getClock().getTime() + maxDurationMs;
         GCJob job = new GCJob(maxRevisionAgeInMillis);
         if (collector.compareAndSet(null, job)) {
             VersionGCStats stats = new VersionGCStats();
             try {
                 long averageDurationMs = 0;
                 while (maxDurationMs <= 0
-                        || (Revision.getCurrentTimestamp() +averageDurationMs) < noLongerThan) {
+                        || (nodeStore.getClock().getTime() +averageDurationMs) < noLongerThan) {
                     log.info("start {}. iteration (avg duration {} sec)",
                             stats.iterationCount, averageDurationMs / 1000.0);
                     job.run(stats);
@@ -147,6 +146,13 @@ public class VersionGarbageCollector {
         GCJob job = collector.get();
         if (job != null) {
             job.cancel();
+        }
+    }
+
+    public void reset() {
+        Document versionGCDoc = ds.find(Collection.SETTINGS, SETTINGS_COLLECTION_ID, 0);
+        if (versionGCDoc != null) {
+            ds.remove(SETTINGS, versionGCDoc.getId());
         }
     }
 
@@ -212,6 +218,42 @@ public class VersionGarbageCollector {
      * @param t    the number of unit in the duration
      */
     public void setModifyBatchDelayMs(TimeUnit unit, long t) { this.modifyBatchDelayMs = unit.toMillis(t); }
+
+    public VersionGCInfo getInfo(long maxRevisionAge, TimeUnit unit) throws IOException {
+        long maxRevisionAgeInMillis = unit.toMillis(maxRevisionAge);
+        long now = nodeStore.getClock().getTime();
+        Recommendations rec = new Recommendations(maxRevisionAgeInMillis, precisionMs, collectLimit);
+        return new VersionGCInfo(rec.lastOldestTimestamp, rec.revisionsOldest,
+                rec.deleteCandidateCount, rec.maxCollect,
+                rec.suggestedIntervalMs, rec.revisionsOlderThan,
+                (int)Math.ceil((now - rec.revisionsOldest) / rec.suggestedIntervalMs));
+    }
+
+    public static class VersionGCInfo {
+        public final long lastSuccess;
+        public final long oldestRevisionEstimate;
+        public final long revisionsCandidateCount;
+        public final long collectLimit;
+        public final long recommendedCleanupInterval;
+        public final long recommendedCleanupTimestamp;
+        public final int estimatedIterations;
+
+        VersionGCInfo(long lastSuccess,
+                      long oldestRevisionEstimate,
+                      long revisionsCandidateCount,
+                      long collectLimit,
+                      long recommendedCleanupInterval,
+                      long recommendedCleanupTimestamp,
+                      int estimatedIterations) {
+            this.lastSuccess = lastSuccess;
+            this.oldestRevisionEstimate = oldestRevisionEstimate;
+            this.revisionsCandidateCount = revisionsCandidateCount;
+            this.collectLimit = collectLimit;
+            this.recommendedCleanupInterval = recommendedCleanupInterval;
+            this.recommendedCleanupTimestamp = recommendedCleanupTimestamp;
+            this.estimatedIterations = estimatedIterations;
+        }
+    }
 
     public static class VersionGCStats {
         boolean ignoredGCDueToCheckPoint;
@@ -383,6 +425,9 @@ public class VersionGarbageCollector {
                     cancel.set(true);
                 } else {
                     final RevisionVector headRevision = nodeStore.getHeadRevision();
+                    log.info("Starting revision garbage collection. Looking at revisions older than [{}]",
+                            Utils.timestampToString(rec.revisionsOlderThan));
+
                     collectDeletedDocuments(phases, headRevision, rec);
                     collectSplitDocuments(phases, rec);
                 }
@@ -863,6 +908,8 @@ public class VersionGarbageCollector {
         final boolean ignoreDueToCheckPoint;
         final long revisionsOlderThan;
         final long maxCollect;
+        final long lastOldestTimestamp;
+        final long deleteCandidateCount;
 
         private final long precisionMs;
         private final long suggestedIntervalMs;
@@ -892,51 +939,53 @@ public class VersionGarbageCollector {
          * @param collectLimit the desired maximum amount of documents to be collected
          */
         Recommendations(long maxRevisionAgeMs, long precisionMs, long collectLimit) {
-            long revisionsOlderThan = nodeStore.getClock().getTime() - maxRevisionAgeMs;
+            long maxOlderThan = nodeStore.getClock().getTime() - maxRevisionAgeMs;
+            long revisionsOlderThan = maxOlderThan;
             boolean ignoreDueToCheckPoint = false;
+            long deletedOnceCount = 0;
+            long suggestedIntervalMs = 0;
 
             this.precisionMs = precisionMs;
-            preferredLimit = Math.min(collectLimit, COLLECT_MAX_SOFT);
+            preferredLimit = Math.min(collectLimit, (long)Math.ceil(overflowToDiskThreshold * 0.9));
             coversUntilNow = true;
-            log.info("Starting revision garbage collection. Looking at revisions older than [{}]",
-                    Utils.timestampToString(revisionsOlderThan));
 
-            revisionsOldest = getLongSetting(SETTINGS_COLLECTION_OLDEST_TIMESTAMP_PROP);
+            lastOldestTimestamp = revisionsOldest = getLongSetting(SETTINGS_COLLECTION_OLDEST_TIMESTAMP_PROP);
             if (revisionsOldest == 0) {
                 // Unknown when the last successful run was, if there ever was one
                 log.debug("No lastOldestTimestamp found, querying for the oldest deletedOnce candidate");
-                revisionsOldest = versionStore.getOldestDeletedOnceTimestamp(precisionMs);
+                revisionsOldest = versionStore.getOldestDeletedOnceTimestamp(nodeStore.getClock(), precisionMs);
                 log.debug("lastOldestTimestamp found: {}", Utils.timestampToString(revisionsOldest));
             }
 
-            try {
-                // And how many might be there?
-                long deletedOnceCount = versionStore.getDeletedOnceCount();
-                if (deletedOnceCount > preferredLimit) {
-                    // We assume that candidates are distributed more or less evenly over time. Reduce the
-                    // scan interval so that we have some confidence to keep the collect size in bounds.
-                    double chunks = ((double) deletedOnceCount) / preferredLimit;
-                    long safeDuration = (long) Math.floor((revisionsOlderThan + maxRevisionAgeMs - revisionsOldest) / chunks);
-                    if (revisionsOldest + safeDuration < revisionsOlderThan) {
-                        revisionsOlderThan = revisionsOldest + safeDuration;
-                        log.debug("deletedOnce candidates: {} found, {} preferred, lowering older to [{}]",
-                                deletedOnceCount, preferredLimit, Utils.timestampToString(revisionsOlderThan));
-                    }
-                }
-            } catch (UnsupportedOperationException ex) {
-                log.debug("check on upper bounds of delete candidates not supported, skipped");
-            }
-
             // Check if we have a time interval recommendation from earlier runs
-            long suggestedIntervalMs = getLongSetting(SETTINGS_COLLECTION_REC_INTERVAL_PROP);
+            suggestedIntervalMs = getLongSetting(SETTINGS_COLLECTION_REC_INTERVAL_PROP);
             if (suggestedIntervalMs > 0) {
                 suggestedIntervalMs = Math.max(suggestedIntervalMs, precisionMs);
-                if (revisionsOlderThan > revisionsOldest + suggestedIntervalMs) {
+                if (maxOlderThan > revisionsOldest + suggestedIntervalMs) {
                     revisionsOlderThan = revisionsOldest + suggestedIntervalMs;
                     coversUntilNow = false;
                     log.debug("previous runs recommend a {} sec duration, lowering older to [{}]",
                             TimeUnit.MILLISECONDS.toSeconds(suggestedIntervalMs),
                             Utils.timestampToString(revisionsOlderThan));
+                }
+            }
+            else {
+                try {
+                    // And how many might be there?
+                    deletedOnceCount = versionStore.getDeletedOnceCount();
+                    if (deletedOnceCount > preferredLimit) {
+                        // We assume that candidates are distributed more or less evenly over time. Reduce the
+                        // scan interval so that we have some confidence to keep the collect size in bounds.
+                        double chunks = ((double) deletedOnceCount) / preferredLimit;
+                        suggestedIntervalMs = (long) Math.floor((revisionsOlderThan + maxRevisionAgeMs - revisionsOldest) / chunks);
+                        if (revisionsOldest + suggestedIntervalMs < revisionsOlderThan) {
+                            revisionsOlderThan = revisionsOldest + suggestedIntervalMs;
+                            log.debug("deletedOnce candidates: {} found, {} preferred, lowering older to [{}]",
+                                    deletedOnceCount, preferredLimit, Utils.timestampToString(revisionsOlderThan));
+                        }
+                    }
+                } catch (UnsupportedOperationException ex) {
+                    log.debug("check on upper bounds of delete candidates not supported, skipped");
                 }
             }
 
@@ -964,6 +1013,7 @@ public class VersionGarbageCollector {
             this.revisionsOlderThan = revisionsOlderThan;
             this.maxCollect = collectLimit;
             this.suggestedIntervalMs = suggestedIntervalMs;
+            this.deleteCandidateCount = deletedOnceCount;
         }
 
         /**

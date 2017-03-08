@@ -37,6 +37,7 @@ enum Mode {
     REPAIR("repair", new RepairCommand()),
     TIKA("tika", new TikaCommand()),
     GARBAGE("garbage", new GarbageCommand()),
+    REVISIONS("revisions", new RevisionsCommand()),
     TARMKDIFF("tarmkdiff", new FileStoreDiffCommand()),
     DATASTORECHECK("datastorecheck", new DataStoreCheckCommand()),
     RESETCLUSTERID("resetclusterid", new ResetClusterIdCommand()),

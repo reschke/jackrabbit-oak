@@ -47,6 +47,11 @@
   <!-- Display information messages from oak-run check (oak-segment-tar) -->
   <logger name="org.apache.jackrabbit.oak.segment.file.tooling.ConsistencyChecker" level="DEBUG"/>
 
+  <!-- Display some more details on RGC for now -->
+  <logger name="org.apache.jackrabbit.oak.plugins.document.VersionGarbageCollector" level="DEBUG"/>
+  <logger name="org.apache.jackrabbit.oak.plugins.document.VersionGCSupport" level="DEBUG"/>
+  <logger name="org.apache.jackrabbit.oak.plugins.document.mongo.MongoVersionGCSupport" level="DEBUG"/>
+
   <root level="warn">
     <appender-ref ref="STDERR" />
   </root>

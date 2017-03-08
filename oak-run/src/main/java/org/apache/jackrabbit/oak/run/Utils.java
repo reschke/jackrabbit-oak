@@ -23,6 +23,8 @@ import static org.apache.jackrabbit.oak.commons.PropertiesUtil.populate;
 import java.io.Closeable;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.util.ArrayList;
 import java.util.Dictionary;
 import java.util.Enumeration;
 import java.util.List;
@@ -57,36 +59,79 @@ class Utils {
     
     private static final long MB = 1024 * 1024;
 
+    public static class NodeStoreOptions {
+
+        public final OptionParser parser;
+        public final OptionSpec<Integer> clusterId;
+        public final OptionSpec<Void> disableBranchesSpec;
+        public final OptionSpec<Integer> cacheSizeSpec;
+        public final OptionSpec<?> help;
+        public final OptionSpec<String> nonOption;
+        public final int NonNodeStoreNonOptionIndex = 1;
+
+        protected OptionSet options;
+
+        public NodeStoreOptions(String usage) {
+            parser = new OptionParser();
+            clusterId = parser
+                    .accepts("clusterId", "MongoMK clusterId").withRequiredArg()
+                    .ofType(Integer.class).defaultsTo(0);
+            disableBranchesSpec = parser.
+                    accepts("disableBranches", "disable branches");
+            cacheSizeSpec = parser.
+                    accepts("cacheSize", "cache size").withRequiredArg().
+                    ofType(Integer.class).defaultsTo(0);
+            help = parser.acceptsAll(asList("h", "?", "help"),"show help").forHelp();
+            nonOption = parser.nonOptions(usage);
+        }
+
+        public NodeStoreOptions parse(String[] args) {
+            assert(options == null);
+            options = parser.parse(args);
+            return this;
+        }
+
+        public void printHelpOn(OutputStream sink) throws IOException {
+            parser.printHelpOn(sink);
+            System.exit(2);
+        }
+
+        public String getStoreArg() {
+            List<String> nonOptions = nonOption.values(options);
+            return nonOptions.size() > 0? nonOptions.get(0) : "";
+        }
+
+        public List<String> getOtherArgs() {
+            List<String> args = new ArrayList<String>(nonOption.values(options));
+            if (args.size() > 0) {
+                args.remove(0);
+            }
+            return args;
+        }
+
+        public int getClusterId() {
+            return clusterId.value(options);
+        }
+
+        public boolean disableBranchesSpec() {
+            return options.has(disableBranchesSpec);
+        }
+
+        public int getCacheSize() {
+            return cacheSizeSpec.value(options);
+        }
+    }
+
     public static NodeStore bootstrapNodeStore(String[] args, Closer closer, String h) throws IOException {
-        //TODO add support for other NodeStore flags
-        OptionParser parser = new OptionParser();
-        OptionSpec<Integer> clusterId = parser
-                .accepts("clusterId", "MongoMK clusterId").withRequiredArg()
-                .ofType(Integer.class).defaultsTo(0);
-        OptionSpec<Void> disableBranchesSpec = parser.
-                accepts("disableBranches", "disable branches");    
-        OptionSpec<Integer> cacheSizeSpec = parser.
-                accepts("cacheSize", "cache size").withRequiredArg().
-                ofType(Integer.class).defaultsTo(0);         
-        OptionSpec<?> help = parser.acceptsAll(asList("h", "?", "help"),
-                "show help").forHelp();
-        OptionSpec<String> nonOption = parser
-                .nonOptions(h);
+        return bootstrapNodeStore(new NodeStoreOptions(h).parse(args), closer);
+    }
 
-        OptionSet options = parser.parse(args);
-        List<String> nonOptions = nonOption.values(options);
-
-        if (options.has(help)) {
-            parser.printHelpOn(System.out);
-            System.exit(0);
+    public static NodeStore bootstrapNodeStore(NodeStoreOptions options, Closer closer) throws IOException {
+        String src = options.getStoreArg();
+        if (src == null || src.length() == 0) {
+            options.printHelpOn(System.err);
         }
 
-        if (nonOptions.isEmpty()) {
-            parser.printHelpOn(System.err);
-            System.exit(1);
-        }
-
-        String src = nonOptions.get(0);
         if (src.startsWith(MongoURI.MONGODB_PREFIX)) {
             MongoClientURI uri = new MongoClientURI(src);
             if (uri.getDatabase() == null) {
@@ -100,11 +145,11 @@ class Utils {
             builder.
                 setMongoDB(mongo.getDB()).
                 setLeaseCheck(false).
-                setClusterId(clusterId.value(options));
-            if (options.has(disableBranchesSpec)) {
+                setClusterId(options.getClusterId());
+            if (options.disableBranchesSpec()) {
                 builder.disableBranches();
             }
-            int cacheSize = cacheSizeSpec.value(options);
+            int cacheSize = options.getCacheSize();
             if (cacheSize != 0) {
                 builder.memoryCacheSize(cacheSize * MB);
             }

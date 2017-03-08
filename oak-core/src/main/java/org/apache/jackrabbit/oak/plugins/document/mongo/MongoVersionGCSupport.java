@@ -36,12 +36,16 @@ import com.mongodb.DBCursor;
 import com.mongodb.DBObject;
 import com.mongodb.QueryBuilder;
 import com.mongodb.ReadPreference;
+import java.util.concurrent.TimeUnit;
+import org.apache.jackrabbit.oak.commons.IOUtils;
 import org.apache.jackrabbit.oak.plugins.document.Document;
 import org.apache.jackrabbit.oak.plugins.document.NodeDocument;
 import org.apache.jackrabbit.oak.plugins.document.SplitDocumentCleanUp;
 import org.apache.jackrabbit.oak.plugins.document.VersionGCSupport;
 import org.apache.jackrabbit.oak.plugins.document.VersionGarbageCollector.VersionGCStats;
 import org.apache.jackrabbit.oak.plugins.document.util.CloseableIterable;
+import org.apache.jackrabbit.oak.plugins.document.util.Utils;
+import org.apache.jackrabbit.oak.stats.Clock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -126,6 +130,35 @@ public class MongoVersionGCSupport extends VersionGCSupport {
                 return store.convertFromDBObject(NODES, input);
             }
         });
+    }
+
+    @Override
+    public long getOldestDeletedOnceTimestamp(Clock clock, long precisionMs) {
+        LOG.debug("getOldestDeletedOnceTimestamp() <- start");
+        DBObject query = start(NodeDocument.DELETED_ONCE).is(Boolean.TRUE).get();
+        DBCursor cursor = getNodeCollection().find(query).sort(start(NodeDocument.MODIFIED_IN_SECS).is(1).get()).limit(1);
+        CloseableIterable results = CloseableIterable.wrap(transform(cursor, new Function<DBObject, NodeDocument>() {
+            @Override
+            public NodeDocument apply(DBObject input) {
+                return store.convertFromDBObject(NODES, input);
+            }
+        }), cursor);
+        try {
+            Iterator<NodeDocument> i = results.iterator();
+            if (i.hasNext()) {
+                NodeDocument doc = i.next();
+                long modifiedMs = doc.getModified() * TimeUnit.SECONDS.toMillis(1);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("getOldestDeletedOnceTimestamp() -> {}", Utils.timestampToString(modifiedMs));
+                }
+                return modifiedMs;
+            }
+        }
+        finally {
+            IOUtils.closeQuietly(results);
+        }
+        LOG.debug("getOldestDeletedOnceTimestamp() -> none found, return current time");
+        return clock.getTime();
     }
 
     private DBObject createQuery(Set<SplitDocType> gcTypes,
