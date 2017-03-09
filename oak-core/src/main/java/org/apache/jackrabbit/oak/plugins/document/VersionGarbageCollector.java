@@ -112,15 +112,17 @@ public class VersionGarbageCollector {
 
     public VersionGCStats gc(long maxRevisionAge, TimeUnit unit) throws IOException {
         long maxRevisionAgeInMillis = unit.toMillis(maxRevisionAge);
-        long noLongerThan = nodeStore.getClock().getTime() + maxDurationMs;
+        TimeInterval maxRunTime = new TimeInterval(nodeStore.getClock().getTime(), Long.MAX_VALUE);
+        if (maxDurationMs > 0) {
+            maxRunTime = maxRunTime.startAndDuration(maxDurationMs);
+        }
         GCJob job = new GCJob(maxRevisionAgeInMillis);
         if (collector.compareAndSet(null, job)) {
             VersionGCStats stats, overall = new VersionGCStats();
             overall.active.start();
             try {
                 long averageDurationMs = 0;
-                while (maxDurationMs <= 0
-                        || (nodeStore.getClock().getTime() +averageDurationMs) < noLongerThan) {
+                while (maxRunTime.contains(nodeStore.getClock().getTime() + averageDurationMs)) {
                     log.info("start {}. run (avg duration {} sec)",
                             overall.iterationCount + 1, averageDurationMs / 1000.0);
                     stats = job.run();
@@ -226,10 +228,10 @@ public class VersionGarbageCollector {
         long maxRevisionAgeInMillis = unit.toMillis(maxRevisionAge);
         long now = nodeStore.getClock().getTime();
         Recommendations rec = new Recommendations(maxRevisionAgeInMillis, precisionMs, collectLimit);
-        return new VersionGCInfo(rec.lastOldestTimestamp, rec.revisionsNewerThan,
+        return new VersionGCInfo(rec.lastOldestTimestamp, rec.scope.fromMs,
                 rec.deleteCandidateCount, rec.maxCollect,
-                rec.suggestedIntervalMs, rec.revisionsOlderThan,
-                (int)Math.ceil((now - rec.revisionsNewerThan) / rec.suggestedIntervalMs));
+                rec.suggestedIntervalMs, rec.scope.toMs,
+                (int)Math.ceil((now - rec.scope.toMs) / rec.suggestedIntervalMs));
     }
 
     public static class VersionGCInfo {
@@ -432,7 +434,7 @@ public class VersionGarbageCollector {
                     cancel.set(true);
                 } else {
                     final RevisionVector headRevision = nodeStore.getHeadRevision();
-                    log.info("Looking at revisions older than [{}]", Utils.timestampToString(rec.revisionsOlderThan));
+                    log.info("Looking at revisions in {}", rec.scope);
 
                     collectDeletedDocuments(phases, headRevision, rec);
                     collectSplitDocuments(phases, rec);
@@ -452,7 +454,7 @@ public class VersionGarbageCollector {
 
         private void collectSplitDocuments(GCPhases phases, Recommendations rec) {
             if (phases.start(GCPhase.SPLITS_CLEANUP)) {
-                versionStore.deleteSplitDocuments(GC_TYPES, rec.revisionsOlderThan, phases.stats);
+                versionStore.deleteSplitDocuments(GC_TYPES, rec.scope.toMs, phases.stats);
                 phases.stop(GCPhase.SPLITS_CLEANUP);
             }
         }
@@ -465,8 +467,7 @@ public class VersionGarbageCollector {
             DeletedDocsGC gc = new DeletedDocsGC(headRevision, cancel);
             try {
                 if (phases.start(GCPhase.COLLECTING)) {
-                    Iterable<NodeDocument> itr = versionStore.getPossiblyDeletedDocs(
-                            rec.revisionsOlderThan, rec.revisionsNewerThan);
+                    Iterable<NodeDocument> itr = versionStore.getPossiblyDeletedDocs(rec.scope.fromMs, rec.scope.toMs);
                     try {
                         for (NodeDocument doc : itr) {
                             // continue with GC?
@@ -567,6 +568,7 @@ public class VersionGarbageCollector {
         private final StringSort prevDocIdsToDelete = newStringSort();
         private final Set<String> exclude = Sets.newHashSet();
         private boolean sorted = false;
+        private int opCount;
 
         public DeletedDocsGC(@Nonnull RevisionVector headRevision,
                              @Nonnull AtomicBoolean cancel) {
@@ -677,7 +679,7 @@ public class VersionGarbageCollector {
         //------------------------------< internal >----------------------------
 
         private void delayOnModifications() {
-            if (modifyBatchDelayMs > 0 && !cancel.get()) {
+            if (!cancel.get() && opCount > 0 && modifyBatchDelayMs > 0) {
                 try {
                     Thread.sleep(modifyBatchDelayMs);
                 }
@@ -685,6 +687,7 @@ public class VersionGarbageCollector {
                     /* ignore */
                 }
             }
+            ++opCount;
         }
 
         private Iterator<String> previousDocIdsFor(NodeDocument doc) {
@@ -932,15 +935,14 @@ public class VersionGarbageCollector {
 
     private class Recommendations {
         final boolean ignoreDueToCheckPoint;
-        final long revisionsOlderThan;
-        final long revisionsNewerThan;
+        final TimeInterval scope;
         final long maxCollect;
-        final long lastOldestTimestamp;
         final long deleteCandidateCount;
+        final long lastOldestTimestamp;
 
         private final long precisionMs;
         private final long suggestedIntervalMs;
-        private final boolean coversUntilNow;
+        private final boolean scopeIsComplete;
 
         /**
          * Gives a recommendation about parameters for the next revision garbage collection run.
@@ -949,7 +951,7 @@ public class VersionGarbageCollector {
          * the desired precision in which times shall be sliced and the given limit on the number
          * of collected documents in one run, calculate <ol>
          *     <li>if gc shall run at all (ignoreDueToCheckPoint)</li>
-         *     <li>from which time onward back into the past shall revisions be collected (revisionsOlderThan)</li>
+         *     <li>in which time interval documents shall be collected (scope)</li>
          *     <li>if collection should fail if it reaches maxCollect documents, maxCollect will specify
          *     the limit or be 0 if no limit shall be enforced.</li>
          * </ol>
@@ -964,48 +966,49 @@ public class VersionGarbageCollector {
          * @param collectLimit the desired maximum amount of documents to be collected
          */
         Recommendations(long maxRevisionAgeMs, long precisionMs, long collectLimit) {
-            long nowOlderThan = nodeStore.getClock().getTime() - maxRevisionAgeMs;
-            long olderThan = nowOlderThan;
+            TimeInterval keep = new TimeInterval(nodeStore.getClock().getTime() - maxRevisionAgeMs, Long.MAX_VALUE);
             boolean ignoreDueToCheckPoint = false;
             long deletedOnceCount = 0;
             long suggestedIntervalMs;
+            long oldestPossible;
 
-            this.lastOldestTimestamp = getLongSetting(SETTINGS_COLLECTION_OLDEST_TIMESTAMP_PROP);
-            if (this.lastOldestTimestamp == 0) {
-                // Unknown when the last successful run was, if there ever was one
+            lastOldestTimestamp = getLongSetting(SETTINGS_COLLECTION_OLDEST_TIMESTAMP_PROP);
+            if (lastOldestTimestamp == 0) {
                 log.debug("No lastOldestTimestamp found, querying for the oldest deletedOnce candidate");
-                this.revisionsNewerThan = versionStore.getOldestDeletedOnceTimestamp(nodeStore.getClock(), precisionMs) - 1;
-                log.debug("lastOldestTimestamp found: {}", Utils.timestampToString(this.revisionsNewerThan));
+                oldestPossible = versionStore.getOldestDeletedOnceTimestamp(nodeStore.getClock(), precisionMs) - 1;
+                log.debug("lastOldestTimestamp found: {}", Utils.timestampToString(oldestPossible));
             }
             else {
-                this.revisionsNewerThan = lastOldestTimestamp - 1;
+                oldestPossible = lastOldestTimestamp - 1;
             }
 
-            // Check if we have a time interval recommendation from earlier runs
+            TimeInterval scope = new TimeInterval(oldestPossible, Long.MAX_VALUE);
+            scope = scope.notLaterThan(keep.fromMs);
+
             suggestedIntervalMs = getLongSetting(SETTINGS_COLLECTION_REC_INTERVAL_PROP);
             if (suggestedIntervalMs > 0) {
                 suggestedIntervalMs = Math.max(suggestedIntervalMs, precisionMs);
-                long suggestedOlderThan = revisionsNewerThan + suggestedIntervalMs;
-                if (suggestedOlderThan < olderThan) {
-                    log.debug("previous runs recommend a {} sec duration, lowering older to [{}]",
-                            TimeUnit.MILLISECONDS.toSeconds(suggestedIntervalMs),
-                            Utils.timestampToString(suggestedOlderThan));
-                    olderThan = suggestedOlderThan;
+                if (suggestedIntervalMs < scope.getDurationMs()) {
+                    scope = scope.startAndDuration(suggestedIntervalMs);
+                    log.debug("previous runs recommend a {} sec duration, scope now {}",
+                            TimeUnit.MILLISECONDS.toSeconds(suggestedIntervalMs), scope);
                 }
             }
             else {
+                /* Need to guess. Count the overall number of _deletedOnce documents. If those
+                 * are more than we want to collect in a single run, reduce the time scope so
+                 * that we likely see a fitting fraction of those documents.
+                 */
                 try {
                     long preferredLimit = Math.min(collectLimit, (long)Math.ceil(overflowToDiskThreshold * 0.95));
                     deletedOnceCount = versionStore.getDeletedOnceCount();
                     if (deletedOnceCount > preferredLimit) {
-                        // We assume that candidates are distributed more or less evenly over time. Reduce the
-                        // scan interval so that we have some confidence to keep the collect size in bounds.
                         double chunks = ((double) deletedOnceCount) / preferredLimit;
-                        suggestedIntervalMs = (long) Math.floor((olderThan + maxRevisionAgeMs - revisionsNewerThan) / chunks);
-                        if (revisionsNewerThan + suggestedIntervalMs < olderThan) {
-                            olderThan = revisionsNewerThan + suggestedIntervalMs;
-                            log.debug("deletedOnce candidates: {} found, {} preferred, lowering older to [{}]",
-                                    deletedOnceCount, preferredLimit, Utils.timestampToString(olderThan));
+                        suggestedIntervalMs = (long) Math.floor((scope.getDurationMs() + maxRevisionAgeMs) / chunks);
+                        if (suggestedIntervalMs < scope.getDurationMs()) {
+                            scope = scope.startAndDuration(suggestedIntervalMs);
+                            log.debug("deletedOnce candidates: {} found, {} preferred, scope now {}",
+                                    deletedOnceCount, preferredLimit, scope);
                         }
                     }
                 } catch (UnsupportedOperationException ex) {
@@ -1015,22 +1018,21 @@ public class VersionGarbageCollector {
 
             //Check for any registered checkpoint which prevent the GC from running
             Revision checkpoint = nodeStore.getCheckpoints().getOldestRevisionToKeep();
-            if (checkpoint != null && checkpoint.getTimestamp() < olderThan) {
-                if (checkpoint.getTimestamp() < (revisionsNewerThan + precisionMs)) {
-                    log.warn("Ignoring revision garbage collection because a valid " +
-                                    "checkpoint [{}] was found, which is older than [{}].",
-                            checkpoint.toReadableString(), Utils.timestampToString(olderThan)
-                    );
+            if (checkpoint != null && scope.endsAfter(checkpoint.getTimestamp())) {
+                TimeInterval minimalScope = scope.startAndDuration(precisionMs);
+                if (minimalScope.endsAfter(checkpoint.getTimestamp())) {
+                    log.warn("Ignoring RGC run because a valid checkpoint [{}] exists inside minimal scope {}.",
+                            checkpoint.toReadableString(), minimalScope);
                     ignoreDueToCheckPoint = true;
                 }
                 else {
-                    olderThan = checkpoint.getTimestamp() - 1;
-                    log.debug("checkpoint at [{}] found, lowering older to [{}]",
-                            Utils.timestampToString(checkpoint.getTimestamp()), Utils.timestampToString(olderThan));
+                    scope = scope.notLaterThan(checkpoint.getTimestamp() - 1);
+                    log.debug("checkpoint at [{}] found, scope now {}",
+                            Utils.timestampToString(checkpoint.getTimestamp()), scope);
                 }
             }
 
-            if (olderThan - revisionsNewerThan <= precisionMs) {
+            if (scope.getDurationMs() <= precisionMs) {
                 // If we have narrowed the collect time interval down as much as we can, no
                 // longer enforce a limit. We need to get through this.
                 collectLimit = 0;
@@ -1039,8 +1041,8 @@ public class VersionGarbageCollector {
 
             this.precisionMs = precisionMs;
             this.ignoreDueToCheckPoint = ignoreDueToCheckPoint;
-            this.revisionsOlderThan = olderThan;
-            this.coversUntilNow = olderThan >= nowOlderThan;
+            this.scope = scope;
+            this.scopeIsComplete = scope.toMs >= keep.fromMs;
             this.maxCollect = collectLimit;
             this.suggestedIntervalMs = suggestedIntervalMs;
             this.deleteCandidateCount = deletedOnceCount;
@@ -1056,7 +1058,7 @@ public class VersionGarbageCollector {
         public void evaluate(VersionGCStats stats) {
             if (stats.limitExceeded) {
                 // if the limit was exceeded, slash the recommended interval in half.
-                long nextDuration = Math.max(precisionMs, (revisionsOlderThan - revisionsNewerThan) / 2);
+                long nextDuration = Math.max(precisionMs, scope.getDurationMs() / 2);
                 log.info("Limit {} documents exceeded, reducing next collection interval to {} seconds",
                         this.maxCollect, TimeUnit.MILLISECONDS.toSeconds(nextDuration));
                 setLongSetting(SETTINGS_COLLECTION_REC_INTERVAL_PROP, nextDuration);
@@ -1064,12 +1066,12 @@ public class VersionGarbageCollector {
             }
             else if (!stats.canceled && !stats.ignoredGCDueToCheckPoint) {
                 // success, we would not expect to encounter revisions older than this in the future
-                setLongSetting(SETTINGS_COLLECTION_OLDEST_TIMESTAMP_PROP, revisionsOlderThan);
+                setLongSetting(SETTINGS_COLLECTION_OLDEST_TIMESTAMP_PROP, scope.toMs);
 
                 if (maxCollect <= 0) {
                     log.debug("successful run without effective limit, keeping recommendations");
                 }
-                else if (revisionsOlderThan - revisionsNewerThan == suggestedIntervalMs) {
+                else if (scope.getDurationMs() == suggestedIntervalMs) {
                     int count = stats.deletedDocGCCount - stats.deletedLeafDocGCCount;
                     double used = count / (double) maxCollect;
                     if (used < 0.66) {
@@ -1082,7 +1084,7 @@ public class VersionGarbageCollector {
                 else {
                     log.debug("successful run not following recommendations, keeping them");
                 }
-                stats.needRepeat = !coversUntilNow;
+                stats.needRepeat = !scopeIsComplete;
             }
         }
 
@@ -1102,6 +1104,65 @@ public class VersionGarbageCollector {
                     (ds.find(Collection.SETTINGS, SETTINGS_COLLECTION_ID) == null));
             updateOp.set(propName, val);
             ds.createOrUpdate(Collection.SETTINGS, updateOp);
+        }
+    }
+
+    public static class TimeInterval {
+        public final long fromMs;
+        public final long toMs;
+
+        public TimeInterval(long fromMs, long toMs) {
+            assert(fromMs <= toMs);
+            this.fromMs = fromMs;
+            this.toMs = toMs;
+        }
+
+        public TimeInterval notLaterThan(long timestampMs) {
+            if (timestampMs < toMs) {
+                return new TimeInterval((timestampMs < fromMs)? timestampMs : fromMs, timestampMs);
+            }
+            return this;
+        }
+
+        public TimeInterval notEarlierThan(long timestampMs) {
+            if (fromMs < timestampMs) {
+                return new TimeInterval(timestampMs, (timestampMs < toMs)? timestampMs : toMs);
+            }
+            return this;
+        }
+
+        public TimeInterval startAndDuration(long durationMs) {
+            return new TimeInterval(fromMs, fromMs + durationMs);
+        }
+
+        public long getDurationMs() {
+            return toMs - fromMs;
+        }
+
+        public boolean contains(long timestampMs) {
+            return fromMs <= timestampMs && timestampMs <= toMs;
+        }
+
+        public boolean endsAfter(long timestampMs) {
+            return toMs > timestampMs;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (o instanceof TimeInterval) {
+                return fromMs == ((TimeInterval) o).fromMs && toMs == ((TimeInterval) o).toMs;
+            }
+            return super.equals(o);
+        }
+
+        @Override
+        public int hashCode() {
+            return (int)(fromMs^(fromMs>>>32)^toMs^(toMs>>>32));
+        }
+
+        @Override
+        public String toString() {
+            return "[" + Utils.timestampToString(fromMs) + ", " + Utils.timestampToString(toMs) + "]";
         }
     }
 }
