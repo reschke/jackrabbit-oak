@@ -25,6 +25,7 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.junit.Assume.assumeTrue;
 
+import java.io.Closeable;
 import java.io.UnsupportedEncodingException;
 import java.sql.BatchUpdateException;
 import java.sql.Connection;
@@ -34,7 +35,12 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import javax.sql.DataSource;
 
 import org.apache.jackrabbit.oak.plugins.document.AbstractDocumentStoreTest;
 import org.apache.jackrabbit.oak.plugins.document.Collection;
@@ -42,8 +48,12 @@ import org.apache.jackrabbit.oak.plugins.document.DocumentStoreException;
 import org.apache.jackrabbit.oak.plugins.document.DocumentStoreFixture;
 import org.apache.jackrabbit.oak.plugins.document.NodeDocument;
 import org.apache.jackrabbit.oak.plugins.document.UpdateOp;
+import org.apache.jackrabbit.oak.plugins.document.rdb.RDBDocumentStore.QueryCondition;
 import org.apache.jackrabbit.oak.plugins.document.rdb.RDBDocumentStore.RDBTableMetaData;
+import org.apache.jackrabbit.oak.plugins.document.util.Utils;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TestName;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -55,6 +65,9 @@ public class RDBDocumentStoreJDBCTest extends AbstractDocumentStoreTest {
     private RDBDocumentStoreJDBC jdbc;
     private RDBDocumentStoreDB dbInfo;
     private static final Logger LOG = LoggerFactory.getLogger(RDBDocumentStoreJDBCTest.class);
+
+    @Rule
+    public TestName name= new TestName();
 
     public RDBDocumentStoreJDBCTest(DocumentStoreFixture dsf) {
         super(dsf);
@@ -261,6 +274,87 @@ public class RDBDocumentStoreJDBCTest extends AbstractDocumentStoreTest {
         } finally {
             con.close();
         }
+    }
+
+    private class MyConnectionHandler extends RDBConnectionHandler {
+
+        public AtomicInteger cnt = new AtomicInteger();
+
+        public MyConnectionHandler(DataSource ds) {
+            super(ds);
+        }
+
+        @Override
+        public Connection getROConnection() throws SQLException {
+            cnt.incrementAndGet();
+            return super.getROConnection();
+        }
+
+        @Override
+        public Connection getRWConnection() throws SQLException {
+            throw new RuntimeException();
+        }
+
+        @Override
+        public void closeConnection(Connection c) {
+            super.closeConnection(c);
+            cnt.decrementAndGet();
+        }
+    }
+
+    @Test
+    public void queryIteratorNotStartedTest() throws SQLException {
+        insertTestResource(this.getClass().getName() + "." + name.getMethodName());
+
+        MyConnectionHandler ch = new MyConnectionHandler(super.rdbDataSource);
+        RDBTableMetaData tmd = ((RDBDocumentStore) super.ds).getTable(Collection.NODES);
+        List<QueryCondition> conditions = Collections.emptyList();
+        Iterator<RDBRow> qi = jdbc.queryAsIterator(ch, tmd, null, null, RDBDocumentStore.EMPTY_KEY_PATTERN, conditions,
+                Integer.MAX_VALUE, null);
+        assertTrue(qi instanceof Closeable);
+        assertEquals(1, ch.cnt.get());
+        Utils.closeIfCloseable(qi);
+        assertEquals(0, ch.cnt.get());
+    }
+
+    @Test
+    public void queryIteratorConsumedTest() throws SQLException {
+        insertTestResource(this.getClass().getName() + "." + name.getMethodName());
+
+        MyConnectionHandler ch = new MyConnectionHandler(super.rdbDataSource);
+        RDBTableMetaData tmd = ((RDBDocumentStore) super.ds).getTable(Collection.NODES);
+        List<QueryCondition> conditions = Collections.emptyList();
+        Iterator<RDBRow> qi = jdbc.queryAsIterator(ch, tmd, null, null, RDBDocumentStore.EMPTY_KEY_PATTERN, conditions,
+                Integer.MAX_VALUE, null);
+        assertTrue(qi instanceof Closeable);
+        assertEquals(1, ch.cnt.get());
+        while (qi.hasNext()) {
+            qi.next();
+        }
+        assertEquals(0, ch.cnt.get());
+    }
+
+    @Test
+    public void queryCountTest() throws SQLException {
+        insertTestResource(this.getClass().getName() + "." + name.getMethodName());
+
+        Connection con = super.rdbDataSource.getConnection();
+        try {
+            con.setReadOnly(true);
+            RDBTableMetaData tmd = ((RDBDocumentStore) super.ds).getTable(Collection.NODES);
+            List<QueryCondition> conditions = Collections.emptyList();
+            long cnt = jdbc.getLong(con, tmd, "count(*)", null, null, RDBDocumentStore.EMPTY_KEY_PATTERN, conditions);
+            assertTrue(cnt > 0);
+        } finally {
+            con.close();
+        }
+    }
+
+    private void insertTestResource(String id) {
+        super.ds.remove(Collection.NODES, id);
+        UpdateOp op = new UpdateOp(id, true);
+        removeMe.add(id);
+        assertTrue(super.ds.create(Collection.NODES, Collections.singletonList(op)));
     }
 
     private static boolean isSuccess(int result) {

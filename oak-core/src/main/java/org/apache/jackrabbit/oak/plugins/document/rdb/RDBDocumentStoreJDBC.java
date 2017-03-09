@@ -23,6 +23,8 @@ import static org.apache.jackrabbit.oak.plugins.document.rdb.RDBDocumentStore.as
 import static org.apache.jackrabbit.oak.plugins.document.rdb.RDBJDBCTools.closeResultSet;
 import static org.apache.jackrabbit.oak.plugins.document.rdb.RDBJDBCTools.closeStatement;
 
+import java.io.Closeable;
+import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.sql.BatchUpdateException;
 import java.sql.Connection;
@@ -37,9 +39,11 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.NoSuchElementException;
 import java.util.Set;
 
 import javax.annotation.CheckForNull;
@@ -449,56 +453,13 @@ public class RDBDocumentStoreJDBC {
     public List<RDBRow> query(Connection connection, RDBTableMetaData tmd, String minId, String maxId,
             List<String> excludeKeyPatterns, List<QueryCondition> conditions, int limit) throws SQLException {
         long start = System.currentTimeMillis();
-        StringBuilder selectClause = new StringBuilder();
-        if (limit != Integer.MAX_VALUE && this.dbInfo.getFetchFirstSyntax() == FETCHFIRSTSYNTAX.TOP) {
-            selectClause.append("TOP " + limit + " ");
-        }
-        selectClause.append("ID, MODIFIED, MODCOUNT, CMODCOUNT, HASBINARY, DELETEDONCE, DATA, BDATA from ").append(tmd.getName());
-
-        String whereClause = buildWhereClause(minId, maxId, excludeKeyPatterns, conditions);
-
-        StringBuilder query = new StringBuilder();
-        query.append("select ").append(selectClause);
-        if (whereClause.length() != 0) {
-            query.append(" where ").append(whereClause);
-        }
-
-        query.append(" order by ID");
-
-        if (limit != Integer.MAX_VALUE) {
-            switch (this.dbInfo.getFetchFirstSyntax()) {
-                case LIMIT:
-                    query.append(" LIMIT " + limit);
-                    break;
-                case FETCHFIRST:
-                    query.append(" FETCH FIRST " + limit + " ROWS ONLY");
-                    break;
-                default:
-                    break;
-            }
-        }
-
-        PreparedStatement stmt = connection.prepareStatement(query.toString());
-        ResultSet rs = null;
         List<RDBRow> result = new ArrayList<RDBRow>();
         long dataTotal = 0, bdataTotal = 0;
+        PreparedStatement stmt = null;
+        ResultSet rs = null;
         try {
-            int si = 1;
-            if (minId != null) {
-                setIdInStatement(tmd, stmt, si++, minId);
-            }
-            if (maxId != null) {
-                setIdInStatement(tmd, stmt, si++, maxId);
-            }
-            for (String keyPattern : excludeKeyPatterns) {
-                setIdInStatement(tmd, stmt, si++, keyPattern);
-            }
-            for (QueryCondition cond : conditions) {
-                stmt.setLong(si++, cond.getValue());
-            }
-            if (limit != Integer.MAX_VALUE) {
-                stmt.setFetchSize(limit);
-            }
+            stmt = prepareQuery(connection, tmd, "ID, MODIFIED, MODCOUNT, CMODCOUNT, HASBINARY, DELETEDONCE, DATA, BDATA", minId,
+                    maxId, excludeKeyPatterns, conditions, limit, "ID");
             rs = stmt.executeQuery();
             while (rs.next() && result.size() < limit) {
                 String id = getIdFromRS(tmd, rs, 1);
@@ -519,8 +480,8 @@ public class RDBDocumentStoreJDBC {
                 bdataTotal += bdata == null ? 0 : bdata.length;
             }
         } finally {
-            closeResultSet(rs);
             closeStatement(stmt);
+            closeResultSet(rs);
         }
 
         long elapsed = System.currentTimeMillis() - start;
@@ -556,6 +517,174 @@ public class RDBDocumentStoreJDBC {
         }
 
         return result;
+    }
+
+    public long getLong(Connection connection, RDBTableMetaData tmd, String selector, String minId, String maxId, List<String> excludeKeyPatterns,
+            List<QueryCondition> conditions) throws SQLException {
+        PreparedStatement stmt = null;
+        ResultSet rs = null;
+        try {
+            stmt = prepareQuery(connection, tmd, selector, minId, maxId, excludeKeyPatterns, conditions, Integer.MAX_VALUE,
+                    null);
+            rs = stmt.executeQuery();
+            rs.next();
+            return rs.getLong(1);
+        } finally {
+            closeStatement(stmt);
+            closeResultSet(rs);
+        }
+    }
+
+    @Nonnull
+    public Iterator<RDBRow> queryAsIterator(RDBConnectionHandler ch, RDBTableMetaData tmd, String minId, String maxId,
+            List<String> excludeKeyPatterns, List<QueryCondition> conditions, int limit, String sortBy) throws SQLException {
+        return new ResultSetIterator(ch, tmd, "ID, MODIFIED, MODCOUNT, CMODCOUNT, HASBINARY, DELETEDONCE, DATA, BDATA", minId,
+                maxId, excludeKeyPatterns, conditions, limit, sortBy);
+    }
+
+    private class ResultSetIterator implements Iterator<RDBRow>, Closeable {
+
+        private RDBConnectionHandler ch;
+        private Connection connection;
+        private RDBTableMetaData tmd;
+        private PreparedStatement stmt;
+        private ResultSet rs;
+        private RDBRow next = null;
+
+        public ResultSetIterator(RDBConnectionHandler ch, RDBTableMetaData tmd, String string, String minId, String maxId, List<String> excludeKeyPatterns, List<QueryCondition> conditions, int limit, String sortBy) throws SQLException {
+            this.ch = ch;
+            this.connection = ch.getROConnection();
+            this.tmd = tmd;
+            this.stmt = prepareQuery(connection, tmd, "ID, MODIFIED, MODCOUNT, CMODCOUNT, HASBINARY, DELETEDONCE, DATA, BDATA", minId,
+                    maxId, excludeKeyPatterns, conditions, limit, sortBy);
+            this.rs = stmt.executeQuery();
+            this.next = internalNext();
+        }
+
+        @Override
+        public boolean hasNext() {
+            return next != null;
+        }
+
+        @Override
+        public void remove() {
+            throw new RuntimeException("remove not supported");
+        }
+
+        @Override
+        public RDBRow next() {
+            RDBRow result = next;
+            if (next != null) {
+                next = internalNext();
+                return result;
+            } else {
+                throw new NoSuchElementException("ResultSet exhausted");
+            }
+        }
+
+        private RDBRow internalNext() {
+            try {
+                if (this.rs.next()) {
+                    String id = getIdFromRS(this.tmd, this.rs, 1);
+                    long modified = readLongFromResultSet(this.rs, 2);
+                    long modcount = readLongFromResultSet(this.rs, 3);
+                    long cmodcount = readLongFromResultSet(this.rs, 4);
+                    Long hasBinary = readLongOrNullFromResultSet(this.rs, 5);
+                    Boolean deletedOnce = readBooleanOrNullFromResultSet(this.rs, 6);
+                    String data = this.rs.getString(7);
+                    byte[] bdata = this.rs.getBytes(8);
+                    return new RDBRow(id, hasBinary, deletedOnce, modified, modcount, cmodcount, data, bdata);
+                } else {
+                    this.rs = closeResultSet(this.rs);
+                    this.stmt = closeStatement(this.stmt);
+                    this.connection.commit();
+                    internalClose();
+                    return null;
+                }
+            } catch (SQLException ex) {
+                LOG.debug("iterating through result set", ex);
+                throw new RuntimeException(ex);
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            internalClose();
+        }
+
+        @Override
+        public void finalize() {
+            if  (this.connection != null) {
+                LOG.error("finalizing unclosed " + this);
+                internalClose();
+            }
+        }
+
+        private void internalClose() {
+            this.rs = closeResultSet(this.rs);
+            this.stmt = closeStatement(this.stmt);
+            this.ch.closeConnection(this.connection);
+            this.connection = null;
+        }
+    }
+
+    @Nonnull
+    private PreparedStatement prepareQuery(Connection connection, RDBTableMetaData tmd, String columns, String minId, String maxId,
+            List<String> excludeKeyPatterns, List<QueryCondition> conditions, int limit, String sortBy) throws SQLException {
+
+        StringBuilder selectClause = new StringBuilder();
+
+        if (limit != Integer.MAX_VALUE && this.dbInfo.getFetchFirstSyntax() == FETCHFIRSTSYNTAX.TOP) {
+            selectClause.append("TOP " + limit + " ");
+        }
+
+        selectClause.append(columns + " from " + tmd.getName());
+
+        String whereClause = buildWhereClause(minId, maxId, excludeKeyPatterns, conditions);
+
+        StringBuilder query = new StringBuilder();
+        query.append("select ").append(selectClause);
+
+        if (whereClause.length() != 0) {
+            query.append(" where ").append(whereClause);
+        }
+
+        if (sortBy != null) {
+            query.append(" order by ID");
+        }
+
+        if (limit != Integer.MAX_VALUE) {
+            switch (this.dbInfo.getFetchFirstSyntax()) {
+                case LIMIT:
+                    query.append(" LIMIT " + limit);
+                    break;
+                case FETCHFIRST:
+                    query.append(" FETCH FIRST " + limit + " ROWS ONLY");
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        PreparedStatement stmt = connection.prepareStatement(query.toString());
+
+        int si = 1;
+        if (minId != null) {
+            setIdInStatement(tmd, stmt, si++, minId);
+        }
+        if (maxId != null) {
+            setIdInStatement(tmd, stmt, si++, maxId);
+        }
+        for (String keyPattern : excludeKeyPatterns) {
+            setIdInStatement(tmd, stmt, si++, keyPattern);
+        }
+        for (QueryCondition cond : conditions) {
+            stmt.setLong(si++, cond.getValue());
+        }
+        if (limit != Integer.MAX_VALUE) {
+            stmt.setFetchSize(limit);
+        }
+        return stmt;
     }
 
     public List<RDBRow> read(Connection connection, RDBTableMetaData tmd, Collection<String> allKeys) throws SQLException {
@@ -822,7 +951,7 @@ public class RDBDocumentStoreJDBC {
 
     private static final Integer INT_FALSE = 0;
     private static final Integer INT_TRUE = 1;
-    
+
     @CheckForNull
     private static Integer deletedOnceAsNullOrInteger(Boolean b) {
         return b == null ? null : (b.booleanValue() ? INT_TRUE : INT_FALSE);
