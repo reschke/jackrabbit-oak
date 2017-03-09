@@ -36,12 +36,12 @@ import com.google.common.collect.Iterators;
 import org.apache.jackrabbit.api.security.user.Authorizable;
 import org.apache.jackrabbit.api.security.user.Query;
 import org.apache.jackrabbit.api.security.user.QueryBuilder;
-import org.apache.jackrabbit.api.security.user.UserManager;
 import org.apache.jackrabbit.oak.api.Result;
 import org.apache.jackrabbit.oak.api.ResultRow;
 import org.apache.jackrabbit.oak.api.Root;
 import org.apache.jackrabbit.oak.commons.PathUtils;
 import org.apache.jackrabbit.oak.namepath.NamePathMapper;
+import org.apache.jackrabbit.oak.security.user.UserManagerImpl;
 import org.apache.jackrabbit.oak.spi.security.ConfigurationParameters;
 import org.apache.jackrabbit.oak.spi.security.principal.EveryonePrincipal;
 import org.apache.jackrabbit.oak.spi.security.user.AuthorizableType;
@@ -58,12 +58,12 @@ public class UserQueryManager {
 
     private static final Logger log = LoggerFactory.getLogger(UserQueryManager.class);
 
-    private final UserManager userManager;
+    private final UserManagerImpl userManager;
     private final NamePathMapper namePathMapper;
     private final ConfigurationParameters config;
     private final Root root;
 
-    public UserQueryManager(UserManager userManager, NamePathMapper namePathMapper,
+    public UserQueryManager(UserManagerImpl userManager, NamePathMapper namePathMapper,
                             ConfigurationParameters config, Root root) {
         this.userManager = userManager;
         this.namePathMapper = namePathMapper;
@@ -251,13 +251,13 @@ public class UserQueryManager {
         }
 
         StringBuilder statement = new StringBuilder();
-        ConditionVisitor visitor = new XPathConditionVisitor(statement, namePathMapper, userManager);
-
+ 
         String searchRoot = namePathMapper.getJcrPath(QueryUtil.getSearchRoot(builder.getSelectorType(), config));
         String ntName = namePathMapper.getJcrName(QueryUtil.getNodeTypeName(builder.getSelectorType()));
         statement.append(searchRoot).append("//element(*,").append(ntName).append(')');
 
         if (condition != null) {
+            ConditionVisitor visitor = new XPathConditionVisitor(statement, namePathMapper, userManager);
             statement.append('[');
             condition.accept(visitor);
             statement.append(']');
