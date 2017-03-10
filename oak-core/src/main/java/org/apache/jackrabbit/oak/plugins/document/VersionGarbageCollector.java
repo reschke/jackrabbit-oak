@@ -77,7 +77,7 @@ public class VersionGarbageCollector {
     private long precisionMs = TimeUnit.MINUTES.toMillis(1);
     private int maxIterations = 0;
     private long maxDurationMs = TimeUnit.HOURS.toMillis(0);
-    private long modifyBatchDelayMs = TimeUnit.MILLISECONDS.toMillis(10);
+    private double modifyBatchDelayFactor  = 0;
     private final AtomicReference<GCJob> collector = newReference();
 
     private static final Logger log = LoggerFactory.getLogger(VersionGarbageCollector.class);
@@ -215,14 +215,17 @@ public class VersionGarbageCollector {
     public void setMaxIterations(int max) { this.maxIterations = max; }
 
     /**
-     * Set a sleep interval between batched database modifications. This rate limits the writes
+     * Set a delay factor between batched database modifications. This rate limits the writes
      * to the database by a garbage collector. 0, e.g. no delay, is the default. This is recommended
      * when garbage collection is done during a maintenance time when other system load is low.
      *
-     * @param unit the unit used for the duration
-     * @param t    the number of unit in the duration
+     * For factory > 0, the actual delay is the duration of the last batch modification times
+     * the factor. Example: 0.25 would result in a 25% delay, e.g. a batch modification running
+     * 10 seconds would be followed by a sleep of 2.5 seconds.
+     *
+     * @param f the factor used to calculate batch modification delays
      */
-    public void setModifyBatchDelayMs(TimeUnit unit, long t) { this.modifyBatchDelayMs = unit.toMillis(t); }
+    public void setModifyBatchDelayFactor(double f) { this.modifyBatchDelayFactor = f; }
 
     public VersionGCInfo getInfo(long maxRevisionAge, TimeUnit unit) throws IOException {
         long maxRevisionAgeInMillis = unit.toMillis(maxRevisionAge);
@@ -549,12 +552,13 @@ public class VersionGarbageCollector {
         private final StringSort prevDocIdsToDelete = newStringSort();
         private final Set<String> exclude = Sets.newHashSet();
         private boolean sorted = false;
-        private int opCount;
+        private final Stopwatch timer;
 
         public DeletedDocsGC(@Nonnull RevisionVector headRevision,
                              @Nonnull AtomicBoolean cancel) {
             this.headRevision = checkNotNull(headRevision);
             this.cancel = checkNotNull(cancel);
+            this.timer = Stopwatch.createUnstarted();
         }
 
         /**
@@ -634,14 +638,12 @@ public class VersionGarbageCollector {
             leafDocIdsToDelete.clear();
             stats.deletedLeafDocGCCount += removeCount;
             stats.deletedDocGCCount += removeCount;
-            delayOnModifications();
         }
 
         void updateResurrectedDocuments(VersionGCStats stats) throws IOException {
             int updateCount = resetDeletedOnce(resurrectedIds);
             resurrectedIds.clear();
             stats.updateResurrectedGCCount += updateCount;
-            delayOnModifications();
         }
 
         public void close() {
@@ -659,16 +661,16 @@ public class VersionGarbageCollector {
 
         //------------------------------< internal >----------------------------
 
-        private void delayOnModifications() {
-            if (!cancel.get() && opCount > 0 && modifyBatchDelayMs > 0) {
+        private void delayOnModifications(long durationMs) {
+            long delayMs = (long)Math.round(maxDurationMs * modifyBatchDelayFactor);
+            if (!cancel.get() && modifyBatchDelayFactor > 0) {
                 try {
-                    Thread.sleep(modifyBatchDelayMs);
+                    Thread.sleep(delayMs);
                 }
                 catch (InterruptedException ex) {
                     /* ignore */
                 }
             }
-            ++opCount;
         }
 
         private Iterator<String> previousDocIdsFor(NodeDocument doc) {
@@ -785,30 +787,35 @@ public class VersionGarbageCollector {
                     log.trace(sb.toString());
                 }
 
-                int nRemoved = ds.remove(NODES, deletionBatch);
+                timer.reset().start();
+                try {
+                    int nRemoved = ds.remove(NODES, deletionBatch);
 
-                if (nRemoved < deletionBatch.size()) {
-                    // some nodes were re-created while GC was running
-                    // find the document that still exist
-                    for (String id : deletionBatch.keySet()) {
-                        NodeDocument d = ds.find(NODES, id);
-                        if (d != null) {
-                            concurrentModification(d);
+                    if (nRemoved < deletionBatch.size()) {
+                        // some nodes were re-created while GC was running
+                        // find the document that still exist
+                        for (String id : deletionBatch.keySet()) {
+                            NodeDocument d = ds.find(NODES, id);
+                            if (d != null) {
+                                concurrentModification(d);
+                            }
                         }
+                        recreatedCount += (deletionBatch.size() - nRemoved);
                     }
-                    recreatedCount += (deletionBatch.size() - nRemoved);
-                }
 
-                deletedCount += nRemoved;
-                log.debug("Deleted [{}] documents so far", deletedCount);
+                    deletedCount += nRemoved;
+                    log.debug("Deleted [{}] documents so far", deletedCount);
 
-                if (deletedCount + recreatedCount - lastLoggedCount >= PROGRESS_BATCH_SIZE) {
-                    lastLoggedCount = deletedCount + recreatedCount;
-                    double progress = lastLoggedCount * 1.0 / getNumDocuments() * 100;
-                    String msg = String.format("Deleted %d (%1.2f%%) documents so far", deletedCount, progress);
-                    log.info(msg);
+                    if (deletedCount + recreatedCount - lastLoggedCount >= PROGRESS_BATCH_SIZE) {
+                        lastLoggedCount = deletedCount + recreatedCount;
+                        double progress = lastLoggedCount * 1.0 / getNumDocuments() * 100;
+                        String msg = String.format("Deleted %d (%1.2f%%) documents so far", deletedCount, progress);
+                        log.info(msg);
+                    }
                 }
-                delayOnModifications();
+                finally {
+                    delayOnModifications(timer.stop().elapsed(TimeUnit.MILLISECONDS));
+                }
             }
             return deletedCount;
         }
@@ -817,23 +824,29 @@ public class VersionGarbageCollector {
             log.info("Proceeding to reset [{}] _deletedOnce flags", resurrectedDocuments.size());
 
             int updateCount = 0;
-            for (String s : resurrectedDocuments) {
-                if (!cancel.get()) {
-                    try {
-                        Map.Entry<String, Long> parsed = parseEntry(s);
-                        UpdateOp up = new UpdateOp(parsed.getKey(), false);
-                        up.equals(MODIFIED_IN_SECS, parsed.getValue());
-                        up.remove(NodeDocument.DELETED_ONCE);
-                        NodeDocument r = ds.findAndUpdate(Collection.NODES, up);
-                        if (r != null) {
-                            updateCount += 1;
+            timer.reset().start();
+            try {
+                for (String s : resurrectedDocuments) {
+                    if (!cancel.get()) {
+                        try {
+                            Map.Entry<String, Long> parsed = parseEntry(s);
+                            UpdateOp up = new UpdateOp(parsed.getKey(), false);
+                            up.equals(MODIFIED_IN_SECS, parsed.getValue());
+                            up.remove(NodeDocument.DELETED_ONCE);
+                            NodeDocument r = ds.findAndUpdate(Collection.NODES, up);
+                            if (r != null) {
+                                updateCount += 1;
+                            }
+                        } catch (IllegalArgumentException ex) {
+                            log.warn("Invalid _modified suffix for {}", s);
+                        } catch (DocumentStoreException ex) {
+                            log.warn("updating {}: {}", s, ex.getMessage());
                         }
-                    } catch (IllegalArgumentException ex) {
-                        log.warn("Invalid _modified suffix for {}", s);
-                    } catch (DocumentStoreException ex) {
-                        log.warn("updating {}: {}", s, ex.getMessage());
                     }
                 }
+            }
+            finally {
+                delayOnModifications(timer.stop().elapsed(TimeUnit.MILLISECONDS));
             }
             return updateCount;
         }
