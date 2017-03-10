@@ -1102,7 +1102,7 @@ public class VersionGarbageCollector {
         public final long toMs;
 
         public TimeInterval(long fromMs, long toMs) {
-            checkArgument(fromMs < toMs);
+            checkArgument(fromMs <= toMs);
             this.fromMs = fromMs;
             this.toMs = toMs;
         }
