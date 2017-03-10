@@ -20,7 +20,6 @@
 package org.apache.jackrabbit.oak.plugins.document.mongo;
 
 import com.mongodb.client.model.DBCollectionCountOptions;
-import com.mongodb.client.model.DBCollectionFindOptions;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
@@ -37,7 +36,6 @@ import com.mongodb.DBObject;
 import com.mongodb.QueryBuilder;
 import com.mongodb.ReadPreference;
 import java.util.concurrent.TimeUnit;
-import org.apache.jackrabbit.oak.commons.IOUtils;
 import org.apache.jackrabbit.oak.plugins.document.Document;
 import org.apache.jackrabbit.oak.plugins.document.NodeDocument;
 import org.apache.jackrabbit.oak.plugins.document.SplitDocumentCleanUp;
@@ -125,7 +123,7 @@ public class MongoVersionGCSupport extends VersionGCSupport {
         LOG.debug("getOldestDeletedOnceTimestamp() <- start");
         DBObject query = start(NodeDocument.DELETED_ONCE).is(Boolean.TRUE).get();
         DBCursor cursor = getNodeCollection().find(query).sort(start(NodeDocument.MODIFIED_IN_SECS).is(1).get()).limit(1);
-        CloseableIterable results = CloseableIterable.wrap(transform(cursor, new Function<DBObject, NodeDocument>() {
+        CloseableIterable<NodeDocument> results = CloseableIterable.wrap(transform(cursor, new Function<DBObject, NodeDocument>() {
             @Override
             public NodeDocument apply(DBObject input) {
                 return store.convertFromDBObject(NODES, input);
@@ -143,7 +141,7 @@ public class MongoVersionGCSupport extends VersionGCSupport {
             }
         }
         finally {
-            IOUtils.closeQuietly(results);
+            Utils.closeIfCloseable(results);
         }
         LOG.debug("getOldestDeletedOnceTimestamp() -> none found, return current time");
         return clock.getTime();

@@ -50,6 +50,7 @@ import org.apache.jackrabbit.oak.plugins.document.util.Utils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.StandardSystemProperty.LINE_SEPARATOR;
 import static com.google.common.collect.Iterables.all;
@@ -205,7 +206,7 @@ public class VersionGarbageCollector {
     public void setMaxDuration(TimeUnit unit, long t) { this.maxDurationMs = unit.toMillis(t); }
 
     /**
-     * Set the maxiumum number of iterations that shall be attempted in a single run. A value
+     * Set the maximum number of iterations that shall be attempted in a single run. A value
      * of 0 means that there is no limit. Since the garbage collector uses iterations to find
      * suitable time intervals and set sizes for cleanups, limiting the iterations is only
      * recommended for setups where the collector is called often.
@@ -218,14 +219,16 @@ public class VersionGarbageCollector {
      * Set a delay factor between batched database modifications. This rate limits the writes
      * to the database by a garbage collector. 0, e.g. no delay, is the default. This is recommended
      * when garbage collection is done during a maintenance time when other system load is low.
-     *
+     * <p>
      * For factory > 0, the actual delay is the duration of the last batch modification times
      * the factor. Example: 0.25 would result in a 25% delay, e.g. a batch modification running
      * 10 seconds would be followed by a sleep of 2.5 seconds.
      *
      * @param f the factor used to calculate batch modification delays
      */
-    public void setModifyBatchDelayFactor(double f) { this.modifyBatchDelayFactor = f; }
+    public void setModifyBatchDelayFactor(double f) {
+        this.modifyBatchDelayFactor = f;
+    }
 
     public VersionGCInfo getInfo(long maxRevisionAge, TimeUnit unit) throws IOException {
         long maxRevisionAgeInMillis = unit.toMillis(maxRevisionAge);
@@ -812,8 +815,7 @@ public class VersionGarbageCollector {
                         String msg = String.format("Deleted %d (%1.2f%%) documents so far", deletedCount, progress);
                         log.info(msg);
                     }
-                }
-                finally {
+                } finally {
                     delayOnModifications(timer.stop().elapsed(TimeUnit.MILLISECONDS));
                 }
             }
@@ -940,7 +942,7 @@ public class VersionGarbageCollector {
 
         /**
          * Gives a recommendation about parameters for the next revision garbage collection run.
-         *
+         * <p>
          * With the given maximum age of revisions to keep (earliest time in the past to collect),
          * the desired precision in which times shall be sliced and the given limit on the number
          * of collected documents in one run, calculate <ol>
@@ -951,7 +953,7 @@ public class VersionGarbageCollector {
          * </ol>
          * After a run, recommendations evaluate the result of the gc to update its persisted recommendations
          * for future runs.
-         *
+         * <p>
          * In the settings collection, recommendations keeps "revisionsOlderThan" from the last successful run.
          * It also updates the time interval recommended for the next run.
          *
@@ -971,8 +973,7 @@ public class VersionGarbageCollector {
                 log.debug("No lastOldestTimestamp found, querying for the oldest deletedOnce candidate");
                 oldestPossible = versionStore.getOldestDeletedOnceTimestamp(nodeStore.getClock(), precisionMs) - 1;
                 log.debug("lastOldestTimestamp found: {}", Utils.timestampToString(oldestPossible));
-            }
-            else {
+            } else {
                 oldestPossible = lastOldestTimestamp - 1;
             }
 
@@ -987,8 +988,7 @@ public class VersionGarbageCollector {
                     log.debug("previous runs recommend a {} sec duration, scope now {}",
                             TimeUnit.MILLISECONDS.toSeconds(suggestedIntervalMs), scope);
                 }
-            }
-            else {
+            } else {
                 /* Need to guess. Count the overall number of _deletedOnce documents. If those
                  * are more than we want to collect in a single run, reduce the time scope so
                  * that we likely see a fitting fraction of those documents.
@@ -1018,8 +1018,7 @@ public class VersionGarbageCollector {
                     log.warn("Ignoring RGC run because a valid checkpoint [{}] exists inside minimal scope {}.",
                             checkpoint.toReadableString(), minimalScope);
                     ignoreDueToCheckPoint = true;
-                }
-                else {
+                } else {
                     scope = scope.notLaterThan(checkpoint.getTimestamp() - 1);
                     log.debug("checkpoint at [{}] found, scope now {}",
                             Utils.timestampToString(checkpoint.getTimestamp()), scope);
@@ -1057,15 +1056,13 @@ public class VersionGarbageCollector {
                         this.maxCollect, TimeUnit.MILLISECONDS.toSeconds(nextDuration));
                 setLongSetting(SETTINGS_COLLECTION_REC_INTERVAL_PROP, nextDuration);
                 stats.needRepeat = true;
-            }
-            else if (!stats.canceled && !stats.ignoredGCDueToCheckPoint) {
+            } else if (!stats.canceled && !stats.ignoredGCDueToCheckPoint) {
                 // success, we would not expect to encounter revisions older than this in the future
                 setLongSetting(SETTINGS_COLLECTION_OLDEST_TIMESTAMP_PROP, scope.toMs);
 
                 if (maxCollect <= 0) {
                     log.debug("successful run without effective limit, keeping recommendations");
-                }
-                else if (scope.getDurationMs() == suggestedIntervalMs) {
+                } else if (scope.getDurationMs() == suggestedIntervalMs) {
                     int count = stats.deletedDocGCCount - stats.deletedLeafDocGCCount;
                     double used = count / (double) maxCollect;
                     if (used < 0.66) {
@@ -1074,8 +1071,7 @@ public class VersionGarbageCollector {
                                 Math.round(used*1000)/10.0, TimeUnit.MILLISECONDS.toSeconds(nextDuration));
                         setLongSetting(SETTINGS_COLLECTION_REC_INTERVAL_PROP, nextDuration);
                     }
-                }
-                else {
+                } else {
                     log.debug("successful run not following recommendations, keeping them");
                 }
                 stats.needRepeat = !scopeIsComplete;
@@ -1106,7 +1102,7 @@ public class VersionGarbageCollector {
         public final long toMs;
 
         public TimeInterval(long fromMs, long toMs) {
-            assert(fromMs <= toMs);
+            checkArgument(fromMs < toMs);
             this.fromMs = fromMs;
             this.toMs = toMs;
         }
