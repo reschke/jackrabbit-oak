@@ -536,25 +536,6 @@ public class VersionGarbageCollector {
         }
     }
 
-    private long getLastOldestTimeStamp() {
-        Document versionGCDoc = ds.find(Collection.SETTINGS, SETTINGS_COLLECTION_ID, 0);
-        return (Long) versionGCDoc.get(SETTINGS_COLLECTION_OLDEST_TIMESTAMP_PROP);
-    }
-
-    private void setLastOldestTimeStamp(long lastGCRunTime) {
-        UpdateOp updateOp = new UpdateOp(SETTINGS_COLLECTION_ID, false);
-        updateOp.set(SETTINGS_COLLECTION_OLDEST_TIMESTAMP_PROP, lastGCRunTime);
-        ds.createOrUpdate(Collection.SETTINGS, updateOp);
-    }
-
-    private void createSettingDocIfNotExist() {
-        if (ds.find(Collection.SETTINGS, SETTINGS_COLLECTION_ID) == null) {
-            UpdateOp updateOp = new UpdateOp(SETTINGS_COLLECTION_ID, true);
-            updateOp.set(SETTINGS_COLLECTION_OLDEST_TIMESTAMP_PROP, 0);
-            ds.create(Collection.SETTINGS, Lists.newArrayList(updateOp));
-        }
-    }
-
     /**
      * A helper class to remove document for deleted nodes.
      */
