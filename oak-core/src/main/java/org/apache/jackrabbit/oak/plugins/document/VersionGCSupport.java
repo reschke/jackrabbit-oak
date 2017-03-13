@@ -24,32 +24,22 @@ import static org.apache.jackrabbit.oak.plugins.document.NodeDocument.getModifie
 import static org.apache.jackrabbit.oak.plugins.document.util.Utils.getAllDocuments;
 import static org.apache.jackrabbit.oak.plugins.document.util.Utils.getSelectedDocuments;
 
-import javax.annotation.CheckForNull;
-import javax.annotation.Nullable;
-
 import java.io.Closeable;
-import java.lang.ref.Reference;
-import java.util.Calendar;
-import java.util.Iterator;
-import java.util.Locale;
 import java.util.Set;
 
-import java.util.concurrent.TimeUnit;
 import org.apache.jackrabbit.oak.commons.IOUtils;
 import org.apache.jackrabbit.oak.plugins.document.NodeDocument.SplitDocType;
 import org.apache.jackrabbit.oak.plugins.document.VersionGarbageCollector.VersionGCStats;
-import org.apache.jackrabbit.oak.plugins.document.util.Utils;
-
-import com.google.common.base.Predicate;
-import org.apache.jackrabbit.oak.plugins.document.util.CloseableIterable;
 import org.apache.jackrabbit.oak.plugins.document.util.Utils;
 import org.apache.jackrabbit.oak.stats.Clock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.base.Predicate;
+
 public class VersionGCSupport {
 
-    private static final Logger Log = LoggerFactory.getLogger(VersionGCSupport.class);
+    private static final Logger LOG = LoggerFactory.getLogger(VersionGCSupport.class);
 
     private final DocumentStore store;
 
@@ -139,7 +129,7 @@ public class VersionGCSupport {
 
         while (duration > precisionMs) {
             // check for delete candidates in [ ts, ts + duration]
-            Log.debug("find oldest _deletedOnce, check < {}", Utils.timestampToString(ts + duration));
+            LOG.debug("find oldest _deletedOnce, check < {}", Utils.timestampToString(ts + duration));
             docs = getPossiblyDeletedDocs(ts, ts + duration);
             if (docs.iterator().hasNext()) {
                 // look if there are still nodes to be found in the lower half
@@ -150,11 +140,9 @@ public class VersionGCSupport {
                 ts = ts + duration;
                 duration /= 2;
             }
-            if (docs instanceof Closeable) {
-                IOUtils.closeQuietly((Closeable)docs);
-            }
+            Utils.closeIfCloseable(docs);
         }
-        Log.debug("find oldest _deletedOnce to be {}", Utils.timestampToString(ts));
+        LOG.debug("find oldest _deletedOnce to be {}", Utils.timestampToString(ts));
         return ts;
     }
 

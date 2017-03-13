@@ -32,7 +32,6 @@ import static org.junit.Assert.fail;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Locale;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
@@ -476,7 +475,7 @@ public class VersionGCDeletionTest {
         for (int i = 0; i < noOfChunks; ++i) {
             NodeBuilder b1 = store.getRoot().builder();
             NodeBuilder xb = b1.child("x"+i);
-            for (int j = 0; j < noOfDocsInChunk; ++j){
+            for (int j = 0; j < noOfDocsInChunk; ++j) {
                 xb.child("a"+j).child("b"+j);
             }
             store.merge(b1, EmptyHook.INSTANCE, CommitInfo.EMPTY);
@@ -484,7 +483,6 @@ public class VersionGCDeletionTest {
         }
 
         long maxAge = 2; //hours
-        long delta = TimeUnit.MINUTES.toMillis(10);
 
         for (int i = 0; i < noOfChunks; ++i) {
             NodeBuilder b2 = store.getRoot().builder();
@@ -527,7 +525,6 @@ public class VersionGCDeletionTest {
     public void deleteChunksInIterations() throws Exception{
         int noOfDocsInChunk = 100;
         int noOfChunks = 10;
-        DocumentStore ts = new MemoryDocumentStore();
         store = new DocumentMK.Builder()
                 .clock(clock)
                 .setDocumentStore(new MemoryDocumentStore())
@@ -549,7 +546,6 @@ public class VersionGCDeletionTest {
         }
 
         long maxAge = 2; //hours
-        long delta = TimeUnit.MINUTES.toMillis(10);
 
         for (int i = 0; i < noOfChunks; ++i) {
             NodeBuilder b2 = store.getRoot().builder();
