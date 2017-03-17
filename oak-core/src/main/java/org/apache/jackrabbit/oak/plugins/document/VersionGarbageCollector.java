@@ -32,7 +32,6 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
-import javax.naming.LimitExceededException;
 
 import com.google.common.base.Function;
 import com.google.common.base.Joiner;
@@ -47,6 +46,7 @@ import org.apache.jackrabbit.oak.commons.sort.StringSort;
 import org.apache.jackrabbit.oak.plugins.document.UpdateOp.Condition;
 import org.apache.jackrabbit.oak.plugins.document.UpdateOp.Key;
 import org.apache.jackrabbit.oak.plugins.document.util.Utils;
+import org.apache.jackrabbit.oak.stats.Clock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -64,23 +64,23 @@ import static org.apache.jackrabbit.oak.plugins.document.NodeDocument.SplitDocTy
 import static org.apache.jackrabbit.oak.plugins.document.NodeDocument.SplitDocType.DEFAULT_LEAF;
 import static org.apache.jackrabbit.oak.plugins.document.UpdateOp.Condition.newEqualsCondition;
 
+/* TODO:Did you consider moving the new set methods on VersionGarbageCollector to a new class
+ * (e.g. VersionGCOptions) and pass it as an argument to gc()? I think with the current patch
+ * it is possible to influence a running GC by calling one of those set methods. */
+
+/* TODO: Can you please add tests for TimeInterval? */
+
+/* TODO: Only minor: the diff for VersionGarbageCollector also contains a couple of indentation
+ * changes for anonymous inner classes, which are unrelated to this improvement. */
+
+
 public class VersionGarbageCollector {
+
     //Kept less than MongoDocumentStore.IN_CLAUSE_BATCH_SIZE to avoid re-partitioning
     private static final int DELETE_BATCH_SIZE = 450;
     private static final int UPDATE_BATCH_SIZE = 450;
     private static final int PROGRESS_BATCH_SIZE = 10000;
     private static final Key KEY_MODIFIED = new Key(MODIFIED_IN_SECS, null);
-    private final DocumentNodeStore nodeStore;
-    private final DocumentStore ds;
-    private final VersionGCSupport versionStore;
-    private int overflowToDiskThreshold = 100000;
-    private long collectLimit = overflowToDiskThreshold;
-    private long precisionMs = TimeUnit.MINUTES.toMillis(1);
-    private int maxIterations = 0;
-    private long maxDurationMs = TimeUnit.HOURS.toMillis(0);
-    private double modifyBatchDelayFactor  = 0;
-    private final AtomicReference<GCJob> collector = newReference();
-
     private static final Logger log = LoggerFactory.getLogger(VersionGarbageCollector.class);
 
     /**
@@ -104,20 +104,27 @@ public class VersionGarbageCollector {
      */
     private static final String SETTINGS_COLLECTION_REC_INTERVAL_PROP = "recommendedIntervalMs";
 
+    private final DocumentNodeStore nodeStore;
+    private final DocumentStore ds;
+    private final VersionGCSupport versionStore;
+    private final AtomicReference<GCJob> collector = newReference();
+    private VersionGCOptions options;
+
     VersionGarbageCollector(DocumentNodeStore nodeStore,
                             VersionGCSupport gcSupport) {
         this.nodeStore = nodeStore;
         this.versionStore = gcSupport;
         this.ds = nodeStore.getDocumentStore();
+        this.options = new VersionGCOptions();
     }
 
     public VersionGCStats gc(long maxRevisionAge, TimeUnit unit) throws IOException {
         long maxRevisionAgeInMillis = unit.toMillis(maxRevisionAge);
         TimeInterval maxRunTime = new TimeInterval(nodeStore.getClock().getTime(), Long.MAX_VALUE);
-        if (maxDurationMs > 0) {
-            maxRunTime = maxRunTime.startAndDuration(maxDurationMs);
+        if (options.maxDurationMs > 0) {
+            maxRunTime = maxRunTime.startAndDuration(options.maxDurationMs);
         }
-        GCJob job = new GCJob(maxRevisionAgeInMillis);
+        GCJob job = new GCJob(maxRevisionAgeInMillis, options);
         if (collector.compareAndSet(null, job)) {
             VersionGCStats stats, overall = new VersionGCStats();
             overall.active.start();
@@ -129,7 +136,7 @@ public class VersionGarbageCollector {
                     stats = job.run();
 
                     overall.addRun(stats);
-                    if (maxIterations > 0 && overall.iterationCount >= maxIterations) {
+                    if (options.maxIterations > 0 && overall.iterationCount >= options.maxIterations) {
                         break;
                     }
                     if (!overall.needRepeat) {
@@ -155,85 +162,23 @@ public class VersionGarbageCollector {
         }
     }
 
+    public VersionGCOptions getOptions() {
+        return this.options;
+    }
+
+    public void setOptions(VersionGCOptions options) {
+        this.options = options;
+    }
+
     public void reset() {
-        Document versionGCDoc = ds.find(Collection.SETTINGS, SETTINGS_COLLECTION_ID, 0);
-        if (versionGCDoc != null) {
-            ds.remove(SETTINGS, versionGCDoc.getId());
-        }
+        ds.remove(SETTINGS, SETTINGS_COLLECTION_ID);
     }
 
-    /**
-     * Set the limit of number of resource id+_modified strings (not length) held in memory during
-     * a collection run. Any more will be stored and sorted in a temporary file.
-     * @param overflowToDiskThreshold limit after which to use file based storage for candidate ids
-     */
-    public void setOverflowToDiskThreshold(int overflowToDiskThreshold) {
-        this.overflowToDiskThreshold = overflowToDiskThreshold;
-    }
-
-    /**
-     * Sets the absolute limit on number of resource ids collected in one run. This does not count
-     * nodes which can be deleted immediately. When this limit is exceeded, the run either fails or
-     * is attempted with different parameters, depending on other settings. Note that if the inspected
-     * time interval is equal or less than {@link #precisionMs}, the collection limit will be ignored.
-     *
-     * @param limit the absolute limit of resources collected in one run
-     */
-    public void setCollectLimit(long limit) {
-        this.collectLimit = limit;
-    }
-
-    /**
-     * Set the minimum duration that is used for time based searches. This should at minimum be the
-     * precision available on modification dates of documents, but can be set larger to avoid querying
-     * the database too often. Note however that {@link #collectLimit} will not take effect for runs
-     * that query equal or shorter than precision duration.
-     *
-     * @param unit time unit used for duration
-     * @param t    the number of units in the duration
-     */
-    public void setPrecisionMs(TimeUnit unit, long t) { this.precisionMs = unit.toMillis(t); }
-
-    /**
-     * Set the maximum duration in elapsed time that the garbage collection shall take. Setting this
-     * to 0 means that there is no limit imposed. A positive duration will impose a soft limit, e.g.
-     * the collection might take longer, but no next iteration will be attempted afterwards. See
-     * {@link #setMaxIterations(int)} on how to control the behaviour.
-     *
-     * @param unit time unit used for duration
-     * @param t    the number of units in the duration
-     */
-    public void setMaxDuration(TimeUnit unit, long t) { this.maxDurationMs = unit.toMillis(t); }
-
-    /**
-     * Set the maximum number of iterations that shall be attempted in a single run. A value
-     * of 0 means that there is no limit. Since the garbage collector uses iterations to find
-     * suitable time intervals and set sizes for cleanups, limiting the iterations is only
-     * recommended for setups where the collector is called often.
-     *
-     * @param max the maximum number of iterations allowed
-     */
-    public void setMaxIterations(int max) { this.maxIterations = max; }
-
-    /**
-     * Set a delay factor between batched database modifications. This rate limits the writes
-     * to the database by a garbage collector. 0, e.g. no delay, is the default. This is recommended
-     * when garbage collection is done during a maintenance time when other system load is low.
-     * <p>
-     * For factory > 0, the actual delay is the duration of the last batch modification times
-     * the factor. Example: 0.25 would result in a 25% delay, e.g. a batch modification running
-     * 10 seconds would be followed by a sleep of 2.5 seconds.
-     *
-     * @param f the factor used to calculate batch modification delays
-     */
-    public void setModifyBatchDelayFactor(double f) {
-        this.modifyBatchDelayFactor = f;
-    }
-
-    public VersionGCInfo getInfo(long maxRevisionAge, TimeUnit unit) throws IOException {
+    public VersionGCInfo getInfo(long maxRevisionAge, TimeUnit unit, VersionGCOptions options)
+            throws IOException {
         long maxRevisionAgeInMillis = unit.toMillis(maxRevisionAge);
         long now = nodeStore.getClock().getTime();
-        Recommendations rec = new Recommendations(maxRevisionAgeInMillis, precisionMs, collectLimit);
+        Recommendations rec = new Recommendations(maxRevisionAgeInMillis, options);
         return new VersionGCInfo(rec.lastOldestTimestamp, rec.scope.fromMs,
                 rec.deleteCandidateCount, rec.maxCollect,
                 rec.suggestedIntervalMs, rec.scope.toMs,
@@ -414,10 +359,12 @@ public class VersionGarbageCollector {
     private class GCJob {
 
         private final long maxRevisionAgeMillis;
+        private final VersionGCOptions options;
         private AtomicBoolean cancel = new AtomicBoolean();
 
-        GCJob(long maxRevisionAgeMillis) {
+        GCJob(long maxRevisionAgeMillis, VersionGCOptions options) {
             this.maxRevisionAgeMillis = maxRevisionAgeMillis;
+            this.options = options;
         }
 
         VersionGCStats run() throws IOException {
@@ -432,7 +379,7 @@ public class VersionGarbageCollector {
         private VersionGCStats gc(long maxRevisionAgeInMillis) throws IOException {
             VersionGCStats stats = new VersionGCStats();
             stats.active.start();
-            Recommendations rec = new Recommendations(maxRevisionAgeInMillis, precisionMs, collectLimit);
+            Recommendations rec = new Recommendations(maxRevisionAgeInMillis, options);
             GCPhases phases = new GCPhases(cancel, stats);
             try {
                 if (rec.ignoreDueToCheckPoint) {
@@ -470,7 +417,7 @@ public class VersionGarbageCollector {
                                              Recommendations rec)
                 throws IOException, LimitExceededException {
             int docsTraversed = 0;
-            DeletedDocsGC gc = new DeletedDocsGC(headRevision, cancel);
+            DeletedDocsGC gc = new DeletedDocsGC(headRevision, cancel, options);
             try {
                 if (phases.start(GCPhase.COLLECTING)) {
                     Iterable<NodeDocument> itr = versionStore.getPossiblyDeletedDocs(rec.scope.fromMs, rec.scope.toMs);
@@ -551,17 +498,22 @@ public class VersionGarbageCollector {
         private final AtomicBoolean cancel;
         private final List<String> leafDocIdsToDelete = Lists.newArrayList();
         private final List<String> resurrectedIds = Lists.newArrayList();
-        private final StringSort docIdsToDelete = newStringSort();
-        private final StringSort prevDocIdsToDelete = newStringSort();
+        private final StringSort docIdsToDelete;
+        private final StringSort prevDocIdsToDelete;
         private final Set<String> exclude = Sets.newHashSet();
         private boolean sorted = false;
         private final Stopwatch timer;
+        private final VersionGCOptions options;
 
         public DeletedDocsGC(@Nonnull RevisionVector headRevision,
-                             @Nonnull AtomicBoolean cancel) {
+                             @Nonnull AtomicBoolean cancel,
+                             @Nonnull VersionGCOptions options) {
             this.headRevision = checkNotNull(headRevision);
             this.cancel = checkNotNull(cancel);
             this.timer = Stopwatch.createUnstarted();
+            this.options = options;
+            this.docIdsToDelete = newStringSort(options);
+            this.prevDocIdsToDelete = newStringSort(options);
         }
 
         /**
@@ -665,10 +617,11 @@ public class VersionGarbageCollector {
         //------------------------------< internal >----------------------------
 
         private void delayOnModifications(long durationMs) {
-            long delayMs = (long)Math.round(maxDurationMs * modifyBatchDelayFactor);
-            if (!cancel.get() && modifyBatchDelayFactor > 0) {
+            long delayMs = (long)Math.round(durationMs * options.delayFactor);
+            if (!cancel.get() && delayMs > 0) {
                 try {
-                    Thread.sleep(delayMs);
+                    Clock clock = nodeStore.getClock();
+                    clock.waitUntil(clock.getTime() + delayMs);
                 }
                 catch (InterruptedException ex) {
                     /* ignore */
@@ -764,7 +717,8 @@ public class VersionGarbageCollector {
 
         private int removeDeletedDocuments(Iterator<String> docIdsToDelete,
                                            long numDocuments,
-                                           String label) throws IOException {
+                                           String label
+                                           ) throws IOException {
             log.info("Proceeding to delete [{}] documents [{}]", numDocuments, label);
 
             Iterator<List<String>> idListItr = partition(docIdsToDelete, DELETE_BATCH_SIZE);
@@ -917,9 +871,8 @@ public class VersionGarbageCollector {
     }
 
     @Nonnull
-    private StringSort newStringSort() {
-        return new StringSort(overflowToDiskThreshold,
-                NodeDocumentIdComparator.INSTANCE);
+    private StringSort newStringSort(VersionGCOptions options) {
+        return new StringSort(options.overflowToDiskThreshold, NodeDocumentIdComparator.INSTANCE);
     }
 
     private static final Predicate<Range> FIRST_LEVEL = new Predicate<Range>() {
@@ -958,20 +911,20 @@ public class VersionGarbageCollector {
          * It also updates the time interval recommended for the next run.
          *
          * @param maxRevisionAgeMs the minimum age for revisions to be collected
-         * @param precisionMs the minimum time interval to be used
-         * @param collectLimit the desired maximum amount of documents to be collected
+         * @param options options for running the gc
          */
-        Recommendations(long maxRevisionAgeMs, long precisionMs, long collectLimit) {
+        Recommendations(long maxRevisionAgeMs, VersionGCOptions options) {
             TimeInterval keep = new TimeInterval(nodeStore.getClock().getTime() - maxRevisionAgeMs, Long.MAX_VALUE);
             boolean ignoreDueToCheckPoint = false;
             long deletedOnceCount = 0;
             long suggestedIntervalMs;
             long oldestPossible;
+            long collectLimit = options.collectLimit;
 
             lastOldestTimestamp = getLongSetting(SETTINGS_COLLECTION_OLDEST_TIMESTAMP_PROP);
             if (lastOldestTimestamp == 0) {
                 log.debug("No lastOldestTimestamp found, querying for the oldest deletedOnce candidate");
-                oldestPossible = versionStore.getOldestDeletedOnceTimestamp(nodeStore.getClock(), precisionMs) - 1;
+                oldestPossible = versionStore.getOldestDeletedOnceTimestamp(nodeStore.getClock(), options.precisionMs) - 1;
                 log.debug("lastOldestTimestamp found: {}", Utils.timestampToString(oldestPossible));
             } else {
                 oldestPossible = lastOldestTimestamp - 1;
@@ -982,7 +935,7 @@ public class VersionGarbageCollector {
 
             suggestedIntervalMs = getLongSetting(SETTINGS_COLLECTION_REC_INTERVAL_PROP);
             if (suggestedIntervalMs > 0) {
-                suggestedIntervalMs = Math.max(suggestedIntervalMs, precisionMs);
+                suggestedIntervalMs = Math.max(suggestedIntervalMs, options.precisionMs);
                 if (suggestedIntervalMs < scope.getDurationMs()) {
                     scope = scope.startAndDuration(suggestedIntervalMs);
                     log.debug("previous runs recommend a {} sec duration, scope now {}",
@@ -994,7 +947,7 @@ public class VersionGarbageCollector {
                  * that we likely see a fitting fraction of those documents.
                  */
                 try {
-                    long preferredLimit = Math.min(collectLimit, (long)Math.ceil(overflowToDiskThreshold * 0.95));
+                    long preferredLimit = Math.min(collectLimit, (long)Math.ceil(options.overflowToDiskThreshold * 0.95));
                     deletedOnceCount = versionStore.getDeletedOnceCount();
                     if (deletedOnceCount > preferredLimit) {
                         double chunks = ((double) deletedOnceCount) / preferredLimit;
@@ -1013,7 +966,7 @@ public class VersionGarbageCollector {
             //Check for any registered checkpoint which prevent the GC from running
             Revision checkpoint = nodeStore.getCheckpoints().getOldestRevisionToKeep();
             if (checkpoint != null && scope.endsAfter(checkpoint.getTimestamp())) {
-                TimeInterval minimalScope = scope.startAndDuration(precisionMs);
+                TimeInterval minimalScope = scope.startAndDuration(options.precisionMs);
                 if (minimalScope.endsAfter(checkpoint.getTimestamp())) {
                     log.warn("Ignoring RGC run because a valid checkpoint [{}] exists inside minimal scope {}.",
                             checkpoint.toReadableString(), minimalScope);
@@ -1025,14 +978,14 @@ public class VersionGarbageCollector {
                 }
             }
 
-            if (scope.getDurationMs() <= precisionMs) {
+            if (scope.getDurationMs() <= options.precisionMs) {
                 // If we have narrowed the collect time interval down as much as we can, no
                 // longer enforce a limit. We need to get through this.
                 collectLimit = 0;
-                log.debug("time interval <= precision ({} ms), disabling collection limits", precisionMs);
+                log.debug("time interval <= precision ({} ms), disabling collection limits", options.precisionMs);
             }
 
-            this.precisionMs = precisionMs;
+            this.precisionMs = options.precisionMs;
             this.ignoreDueToCheckPoint = ignoreDueToCheckPoint;
             this.scope = scope;
             this.scopeIsComplete = scope.toMs >= keep.fromMs;
@@ -1154,5 +1107,8 @@ public class VersionGarbageCollector {
         public String toString() {
             return "[" + Utils.timestampToString(fromMs) + ", " + Utils.timestampToString(toMs) + "]";
         }
+    }
+
+    private static final class LimitExceededException extends Exception {
     }
 }

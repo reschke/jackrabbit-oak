@@ -206,7 +206,7 @@ public class VersionGCDeletionTest {
         //3. Check that deleted doc does get collected post maxAge
         clock.waitUntil(clock.getTime() + HOURS.toMillis(maxAge*2) + delta);
         VersionGarbageCollector gc = store.getVersionGarbageCollector();
-        gc.setOverflowToDiskThreshold(100);
+        gc.setOptions(gc.getOptions().withOverflowToDiskThreshold(100));
 
         VersionGCStats stats = gc.gc(maxAge * 2, HOURS);
         assertEquals(noOfDocsToDelete * 2 + 1, stats.deletedDocGCCount);
@@ -255,7 +255,7 @@ public class VersionGCDeletionTest {
         //3. Check that deleted doc does get collected post maxAge
         clock.waitUntil(clock.getTime() + HOURS.toMillis(maxAge*2) + delta);
         VersionGarbageCollector gc = store.getVersionGarbageCollector();
-        gc.setOverflowToDiskThreshold(100);
+        gc.setOptions(gc.getOptions().withOverflowToDiskThreshold(100));
 
         VersionGCStats stats = gc.gc(maxAge * 2, HOURS);
         assertEquals(noOfDocsToDelete * 2 + 1, stats.deletedDocGCCount);
@@ -435,16 +435,15 @@ public class VersionGCDeletionTest {
 
         clock.waitUntil(clock.getTime() + HOURS.toMillis(maxAge*2) + delta);
         VersionGarbageCollector gc = store.getVersionGarbageCollector();
-        gc.setCollectLimit(100);
-
         // The first attempt will hit the collection limit and fail.
         // However repeated attempts will finally succeed and cleanup everything
-        gc.setMaxIterations(1);
+        gc.setOptions(gc.getOptions().withCollectLimit(100).withMaxIterations(1));
+
         VersionGCStats stats = gc.gc(maxAge * 2, HOURS);
         assertEquals(stats.limitExceeded, true);
 
-        gc.setMaxIterations(0);
-        gc.setMaxDuration(TimeUnit.MINUTES, 5);
+        gc.setOptions(gc.getOptions().withMaxIterations(0).withMaxDuration(TimeUnit.MINUTES, 5));
+
         stats = gc.gc(maxAge * 2, HOURS);
         assertEquals(stats.canceled, false);
         assertEquals(noOfDocsToDelete * 2 + 1, stats.deletedDocGCCount);
@@ -495,8 +494,7 @@ public class VersionGCDeletionTest {
         store.runBackgroundOperations();
 
         VersionGarbageCollector gc = store.getVersionGarbageCollector();
-        gc.setCollectLimit(101);
-        gc.setMaxIterations(1);
+        gc.setOptions(gc.getOptions().withCollectLimit(101).withMaxIterations(1));
 
         // The first attempt will hit the collection limit and fail.
         // However repeated attempts will finally succeed and cleanup a chunk of docs
@@ -559,8 +557,7 @@ public class VersionGCDeletionTest {
 
         VersionGarbageCollector gc = store.getVersionGarbageCollector();
         // limit chunk size and allow unlimited iterations
-        gc.setCollectLimit(101);
-        gc.setMaxIterations(0);
+        gc.setOptions(gc.getOptions().withCollectLimit(101).withMaxIterations(0));
         VersionGCStats stats = gc.gc(maxAge, HOURS);
 
         // All should be cleaned up now in > nOfChunks iterations
