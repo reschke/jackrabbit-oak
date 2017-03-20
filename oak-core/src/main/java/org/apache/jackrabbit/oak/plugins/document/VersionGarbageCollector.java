@@ -174,7 +174,7 @@ public class VersionGarbageCollector {
         ds.remove(SETTINGS, SETTINGS_COLLECTION_ID);
     }
 
-    public VersionGCInfo getInfo(long maxRevisionAge, TimeUnit unit, VersionGCOptions options)
+    public VersionGCInfo getInfo(long maxRevisionAge, TimeUnit unit)
             throws IOException {
         long maxRevisionAgeInMillis = unit.toMillis(maxRevisionAge);
         long now = nodeStore.getClock().getTime();
