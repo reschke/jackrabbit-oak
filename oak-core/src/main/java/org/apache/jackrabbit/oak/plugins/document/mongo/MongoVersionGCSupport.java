@@ -95,7 +95,7 @@ public class MongoVersionGCSupport extends VersionGCSupport {
     public long getDeletedOnceCount() {
         DBObject query = start(NodeDocument.DELETED_ONCE).is(Boolean.TRUE).get();
         DBCollectionCountOptions options = new DBCollectionCountOptions();
-        options.readPreference(ReadPreference.nearest().secondaryPreferred());
+        options.readPreference(ReadPreference.secondaryPreferred());
         return getNodeCollection().count(query, options);
     }
 
